@@ -658,7 +658,6 @@ def ping_loop() -> None:
 
 
 
-
 if __name__ == "__main__":
     load_phones()
     threading.Thread(target=ping_loop, daemon=True).start()
