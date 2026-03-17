@@ -1,11 +1,14 @@
 from flask import Flask, request, jsonify, send_file, session, redirect, url_for
+from flask_socketio import SocketIO
 import json
 import time
 import subprocess
 import threading
 import re
-import os
 import secrets
+import socket
+import urllib.request
+import urllib.parse
 from pathlib import Path
 from functools import wraps
 from datetime import timedelta
@@ -13,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = secrets.token_hex(16)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")
@@ -29,6 +34,51 @@ LOGIN_MAX_ATTEMPTS = 7
 LOGIN_BLOCK_SECONDS = 900  # 15 минут
 
 API_AUTH_ROUTES = {"/phones", "/add_phone", "/update_phone", "/delete_phone", "/reorder"}
+
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # не обязательно, чтобы хост существовал
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+LOCAL_IP = get_local_ip()
+TARGET_IP = "10.58.22.25"
+TARGET_PORT = 8000
+
+
+def duplicate_get_request(url_path, query_params):
+    if LOCAL_IP == TARGET_IP:
+        return
+
+    # Строим URL для дублирования
+    target_url = f"http://{TARGET_IP}:{TARGET_PORT}{url_path}"
+    if query_params:
+        target_url += "?" + urllib.parse.urlencode(query_params)
+    
+    def send_request():
+        try:
+            with urllib.request.urlopen(target_url, timeout=5) as response:
+                response.read()
+        except Exception as e:
+            # Игнорируем ошибки при дублировании, чтобы не мешать основной работе
+            pass
+
+    threading.Thread(target=send_request, daemon=True).start()
+
+
+@app.before_request
+def before_request_func():
+    if request.method == "GET" and LOCAL_IP != TARGET_IP:
+        # Не дублируем статические файлы и иконки, если нужно сэкономить ресурсы
+        # Но по ТЗ "отправлял дублирубщие get запросы", так что дублируем всё
+        duplicate_get_request(request.path, request.args.to_dict())
 
 
 def load_or_create_auth() -> dict:
@@ -212,17 +262,6 @@ def save_phones(username: str) -> None:
         )
 
 
-def format_duration(seconds: float) -> str:
-    total = int(seconds)
-    hours = total // 3600
-    minutes = (total % 3600) // 60
-    secs = total % 60
-
-    if hours > 0:
-        return f"{hours:02}:{minutes:02}:{secs:02}"
-    return f"{minutes:02}:{secs:02}"
-
-
 def normalize_number(value: str | None) -> str:
     if value is None:
         return ""
@@ -239,8 +278,7 @@ def clean_remote(value: str | None) -> str:
 
 
 def broadcast_update():
-    # SocketIO удален, теперь фронтенд использует поллинг
-    pass
+    socketio.emit('phones_update', {'data': 'updated'}, namespace='/')
 
 
 def set_state(number: str, state: str, peer: str | None = None) -> None:
@@ -253,15 +291,13 @@ def set_state(number: str, state: str, peer: str | None = None) -> None:
 
                 if state in ["Разговор", "Исходящий_вызов", "Входящий_вызов", "Удержание", "Снята_трубка"]:
                     phone["time"] = time.strftime("%H:%M:%S")
+                    if phone["call_start"] is None:
+                        phone["call_start"] = time.time()
 
                 if peer is not None and peer != "":
                     phone["peer"] = peer
                 else:
                     phone["peer"] = "Не определен"
-
-                if state == "Разговор":
-                    if phone["call_start"] is None:
-                        phone["call_start"] = time.time()
 
                 if state in {"В_покое", "OFFLINE", "DND"}:
                     phone["call_start"] = None
@@ -278,13 +314,9 @@ def get_sorted_phones(username: str) -> list[dict]:
             return []
             
         phones = users_phones[username]
-        now = time.time()
         result = []
 
         for number, phone in phones.items():
-            if phone["call_start"] is not None and phone["state"] == "Разговор":
-                phone["duration"] = format_duration(now - phone["call_start"])
-
             result.append({
                 "number": number,
                 **phone
@@ -325,13 +357,17 @@ def login_page():
 
 
 @app.route("/register", methods=["POST"])
+@login_required
 def register():
+    # Регистрация доступна только админу
+    if session.get("username") != "admin":
+        return jsonify({"ok": False, "error": "Доступ запрещен"}), 403
+
     data = request.get_json(silent=True) or {}
     username = str(data.get("username", "")).strip()
-    password = str(data.get("password", "")).strip()
 
-    if not username or not password:
-        return jsonify({"ok": False, "error": "Введите логин и пароль"}), 400
+    if not username:
+        return jsonify({"ok": False, "error": "Введите логин"}), 400
 
     if len(username) < 3:
         return jsonify({"ok": False, "error": "Логин слишком короткий"}), 400
@@ -339,7 +375,10 @@ def register():
     if username in AUTH:
         return jsonify({"ok": False, "error": "Пользователь уже существует"}), 400
 
+    # Генерируем пароль автоматически
+    password = secrets.token_urlsafe(10)
     event_token = secrets.token_hex(16)
+    
     AUTH[username] = {
         "username": username,
         "password_hash": generate_password_hash(password),
@@ -351,11 +390,17 @@ def register():
     
     # Создаем пустой файл телефонов для нового пользователя
     user_file = PHONES_DIR / f"phones_{username}.json"
-    user_file.write_text("[]", encoding="utf-8")
+    if not user_file.exists():
+        user_file.write_text("[]", encoding="utf-8")
+    
     with lock:
         users_phones[username] = {}
 
-    return jsonify({"ok": True, "event_token": event_token})
+    return jsonify({
+        "ok": True, 
+        "password": password, 
+        "event_token": event_token
+    })
 
 
 @app.route("/logout", methods=["POST"])
@@ -592,21 +637,24 @@ def ping_once(ip: str):
         return None
 
     try:
+        # Оптимизированные параметры ping для снижения нагрузки (Windows):
+        # -n 1: один пакет
+        # -w 500: таймаут 500мс (достаточно для локальной сети)
+        # -l 1: минимальный размер данных (1 байт) для экономии трафика
+        # creationflags=0x08000000: запуск без создания окна консоли (CREATE_NO_WINDOW)
         result = subprocess.run(
-            ["ping", "-n", "1", "-w", "1000", ip],
+            ["ping", "-n", "1", "-w", "500", "-l", "1", ip],
             capture_output=True,
             text=True,
-            check=False
+            check=False,
+            creationflags=0x08000000
         )
 
         if result.returncode != 0:
             return None
 
-        match = re.search(r"time[=<]\s*(\d+)", result.stdout, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-
-        match = re.search(r"время[=<]\s*(\d+)", result.stdout, re.IGNORECASE)
+        # Объединенный поиск времени ответа (поддержка RU/EN локалей)
+        match = re.search(r"(?:time|время)[=<]\s*(\d+)", result.stdout, re.IGNORECASE)
         if match:
             return int(match.group(1))
 
@@ -616,17 +664,33 @@ def ping_once(ip: str):
 
 
 def ping_loop() -> None:
-    executor = ThreadPoolExecutor(max_workers=20)
+    # Увеличиваем число воркеров до 100 для масштабируемости.
+    # Это позволяет обрабатывать сотни пингов одновременно, не блокируя мониторинг.
+    executor = ThreadPoolExecutor(max_workers=100)
+    
     while True:
         snapshot = []
+        now = time.time()
+        any_changed = False
+        
         with lock:
             for username, phones in users_phones.items():
                 for number, phone in phones.items():
-                    snapshot.append((username, number, phone["ip"]))
+                    # Очистка зависших состояний "Снята_трубка" (таймаут 60 сек)
+                    if phone.get("state") == "Снята_трубка" and phone.get("call_start"):
+                        if now - phone["call_start"] > 60:
+                            phone["state"] = "В_покое"
+                            phone["call_start"] = None
+                            phone["peer"] = ""
+                            phone["duration"] = "00:00"
+                            any_changed = True
+                    
+                    ip_addr = phone.get("ip", "").strip()
+                    if ip_addr:
+                        snapshot.append((username, number, ip_addr))
 
         def task(uname, num, ip_addr):
             latency = ping_once(ip_addr)
-            changed = False
             with lock:
                 if uname not in users_phones or num not in users_phones[uname]:
                     return False
@@ -645,20 +709,36 @@ def ping_loop() -> None:
                     if phone["state"] == "OFFLINE":
                         phone["state"] = "В_покое"
                 
-                if phone["ping"] != old_ping or phone["state"] != old_state:
-                    changed = True
-            return changed
+                return phone.get("ping") != old_ping or phone.get("state") != old_state
 
-        results = list(executor.map(lambda p: task(*p), snapshot))
-        
-        if any(results):
+        if snapshot:
+            # Распределяем запуск процессов во времени (shaping), чтобы избежать пиков CPU.
+            # Для 2000 телефонов размазываем запуск пачки на ~10 секунд.
+            futures = []
+            delay = 10.0 / len(snapshot) if len(snapshot) > 50 else 0
+            
+            for p in snapshot:
+                futures.append(executor.submit(task, *p))
+                if delay > 0:
+                    time.sleep(delay)
+            
+            # Собираем результаты и проверяем наличие изменений
+            for f in futures:
+                try:
+                    if f.result():
+                        any_changed = True
+                except:
+                    pass
+
+        if any_changed:
             broadcast_update()
 
-        time.sleep(60)
+        # Пауза перед следующим полным циклом мониторинга
+        time.sleep(10)
 
 
 
 if __name__ == "__main__":
     load_phones()
     threading.Thread(target=ping_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=8000)
+    socketio.run(app, host="0.0.0.0", port=8000, debug=True)

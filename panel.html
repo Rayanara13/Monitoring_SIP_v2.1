@@ -153,6 +153,7 @@ body{
   background:#0f1730;
   color:var(--text);
   border:1px solid rgba(255,255,255,.08);
+  user-select: text;
 }
 
 .input::placeholder{
@@ -287,6 +288,7 @@ body{
   resize:both;
   min-width:280px;
   min-height:240px;
+  user-select: none;
 }
 
 .card-resized{
@@ -530,6 +532,7 @@ body{
 }
 </style>
 </head>
+<script src="/static/socket.io.min.js"></script>
 <body>
 <div class="container">
 
@@ -618,9 +621,27 @@ body{
   </div>
 
   <div id="tab-accounts" class="tab-content">
+    <div class="panel" style="margin-bottom:20px">
+      <div class="panel-head">
+        <div class="panel-title">Регистрация нового пользователя</div>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid" style="grid-template-columns: 1fr auto">
+          <input id="reg-username" class="input" placeholder="Логин (минимум 3 символа)">
+          <button class="btn" onclick="registerUser()">Зарегистрировать</button>
+        </div>
+        <div id="reg-result" style="margin-top:15px; display:none; padding:15px; border-radius:14px; background:rgba(34,197,94,0.1); border:1px solid var(--green)">
+          <div style="color:var(--green); font-weight:bold; margin-bottom:10px">Пользователь успешно создан!</div>
+          <div style="font-size:14px; margin-bottom:5px">Логин: <strong id="res-login"></strong></div>
+          <div style="font-size:14px; margin-bottom:5px">Пароль: <strong id="res-password" style="color:var(--orange); font-size:18px"></strong></div>
+          <div style="font-size:12px; color:var(--muted); margin-top:10px">⚠️ Внимание! Пароль показывается только один раз. Обязательно сохраните его.</div>
+        </div>
+      </div>
+    </div>
+
     <div class="panel">
       <div class="panel-head">
-        <div class="panel-title">Управление аккаунтами</div>
+        <div class="panel-title">Список пользователей</div>
       </div>
       <div class="panel-body" style="padding:0">
         <table class="users-table">
@@ -663,6 +684,34 @@ body{
 <script>
 let dragNumber = null;
 let refreshInFlight = false;
+let socket = null;
+
+function initSocket() {
+  socket = io();
+  
+  socket.on('connect', () => {
+    console.log('Socket.IO connected');
+    const statusEl = document.getElementById("connection-status");
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="dot green"></span> Статус: Онлайн';
+      statusEl.style.color = "var(--green)";
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Socket.IO disconnected');
+    const statusEl = document.getElementById("connection-status");
+    if (statusEl) {
+      statusEl.innerHTML = '<span class="dot red"></span> Статус: Отключено';
+      statusEl.style.color = "var(--red)";
+    }
+  });
+
+  socket.on('phones_update', (msg) => {
+    console.log('Update received via socket', msg);
+    refreshLoop();
+  });
+}
 
 function prettyState(state){
   return (state || "").replaceAll("_", " ");
@@ -738,7 +787,7 @@ function phoneCard(phone){
         </div>
       </div>
 
-      <div class="card-actions">
+      <div class="card-actions" onmousedown="event.stopPropagation()">
         <button class="btn btn-sm secondary" onclick="openEditModal('${escapeHtml(phone.number)}')">Редактировать</button>
         <button class="btn btn-sm secondary" onclick="moveUp('${escapeHtml(phone.number)}')">Выше</button>
         <button class="btn btn-sm danger" onclick="deletePhone('${escapeHtml(phone.number)}')">Удалить</button>
@@ -1029,6 +1078,38 @@ async function loadAdminUsers(){
   }
 }
 
+async function registerUser(){
+  const username = document.getElementById("reg-username").value.trim();
+  const resDiv = document.getElementById("reg-result");
+  
+  if(!username){
+    alert("Введите логин");
+    return;
+  }
+  
+  try{
+    const response = await fetch("/register", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({username})
+    });
+    const data = await response.json();
+    
+    if(data.ok){
+      document.getElementById("res-login").textContent = username;
+      document.getElementById("res-password").textContent = data.password;
+      resDiv.style.display = "block";
+      document.getElementById("reg-username").value = "";
+      loadAdminUsers();
+    } else {
+      alert(data.error || "Ошибка регистрации");
+    }
+  }catch(e){
+    console.error(e);
+    alert("Ошибка при отправке запроса");
+  }
+}
+
 async function loadUserInfo(){
   try {
     const response = await fetch("/user_info");
@@ -1097,6 +1178,7 @@ document.getElementById("edit-backdrop").addEventListener("click", (e) => {
 
 window.onload = async () => {
   await loadUserInfo();
+  initSocket();
   refreshLoop();
   
       // Интервал для обновления таймеров длительности разговора локально
@@ -1104,7 +1186,8 @@ window.onload = async () => {
         if (window.__lastPhones) {
            const now = Math.floor(Date.now() / 1000);
            window.__lastPhones.forEach(p => {
-             if (p.state === "Разговор" && p.call_start) {
+             const activeStates = ["Разговор", "Исходящий_вызов", "Входящий_вызов", "Удержание", "Снята_трубка"];
+             if (activeStates.includes(p.state) && p.call_start) {
                 const diff = now - Math.floor(p.call_start);
                 // Защита от нереальных цифр
                 if (diff < 0 || diff > 86400) {
@@ -1113,12 +1196,15 @@ window.onload = async () => {
                 
                 // Обновляем отображение длительности без полной перерисовки всех карточек
                 // Для этого найдем карточку в DOM
-                const cards = document.querySelectorAll(`[data-number="${p.number}"] .info-value`);
-                if (cards.length > 1) { // 0: Собеседник, 1: Длительность
-                    const durationStr = formatDuration(diff);
-                    if (cards[1].textContent !== durationStr) {
-                        cards[1].textContent = durationStr;
-                        p.duration = durationStr;
+                const cardEl = document.querySelector(`[data-number="${p.number}"]`);
+                if (cardEl) {
+                    const infoValues = cardEl.querySelectorAll(".info-value");
+                    if (infoValues.length > 1) { // 0: Собеседник, 1: Длительность
+                        const durationStr = formatDuration(diff);
+                        if (infoValues[1].textContent !== durationStr) {
+                            infoValues[1].textContent = durationStr;
+                            p.duration = durationStr;
+                        }
                     }
                 }
              }
@@ -1126,8 +1212,8 @@ window.onload = async () => {
         }
       }, 1000);
 
-  // Основной цикл обновления данных (вместо сокетов)
-  setInterval(refreshLoop, 3000);
+  // Основной цикл обновления данных (вместо сокетов) - теперь через Socket.IO
+  // setInterval(refreshLoop, 3000);
 };
 
 function formatDuration(total) {
