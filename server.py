@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = secrets.token_hex(16)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 PHONES_DIR = Path("users_data")
@@ -49,8 +48,18 @@ def get_local_ip():
 
 
 LOCAL_IP = get_local_ip()
-TARGET_IP = "10.58.22.25"
-TARGET_PORT = 8000
+
+
+def get_env_value(key: str, default: str = "") -> str:
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip()
+    return default
+
+
+TARGET_IP = get_env_value("TARGET_IP", "10.58.22.25")
+TARGET_PORT = int(get_env_value("TARGET_PORT", "8000"))
 
 
 def duplicate_get_request(url_path, query_params):
@@ -128,9 +137,10 @@ def get_app_secret():
         for line in lines:
             if line.startswith("APP_SECRET_KEY="):
                 return line.split("=", 1)[1]
-    
+
     key = secrets.token_hex(32)
-    ENV_FILE.write_text(f"APP_SECRET_KEY={key}\n")
+    with open(ENV_FILE, "a") as f:
+        f.write(f"APP_SECRET_KEY={key}\n")
     return key
 
 
@@ -637,23 +647,28 @@ def ping_once(ip: str):
         return None
 
     try:
-        # Оптимизированные параметры ping для снижения нагрузки (Windows):
-        # -n 1: один пакет
-        # -w 500: таймаут 500мс (достаточно для локальной сети)
-        # -l 1: минимальный размер данных (1 байт) для экономии трафика
-        # creationflags=0x08000000: запуск без создания окна консоли (CREATE_NO_WINDOW)
+        import platform
+        is_windows = platform.system() == "Windows"
+
+        if is_windows:
+            cmd = ["ping", "-n", "1", "-w", "500", "-l", "1", ip]
+            kwargs = {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+        else:
+            cmd = ["ping", "-c", "1", "-W", "1", "-s", "1", ip]
+            kwargs = {}
+
         result = subprocess.run(
-            ["ping", "-n", "1", "-w", "500", "-l", "1", ip],
+            cmd,
             capture_output=True,
             text=True,
             check=False,
-            creationflags=0x08000000
+            **kwargs
         )
 
         if result.returncode != 0:
             return None
 
-        # Объединенный поиск времени ответа (поддержка RU/EN локалей)
+        # Поиск времени ответа (поддержка RU/EN локалей, Linux/Windows форматов)
         match = re.search(r"(?:time|время)[=<]\s*(\d+)", result.stdout, re.IGNORECASE)
         if match:
             return int(match.group(1))
@@ -727,7 +742,7 @@ def ping_loop() -> None:
                 try:
                     if f.result():
                         any_changed = True
-                except:
+                except Exception:
                     pass
 
         if any_changed:

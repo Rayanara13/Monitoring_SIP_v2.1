@@ -99,6 +99,9 @@ h1{
       <input id="password" class="input" placeholder="Пароль" type="password" autocomplete="current-password">
       <button class="btn" id="login-btn" onclick="login()">Войти</button>
     </div>
+    <div style="text-align:center; margin-top:14px">
+      <span style="color:var(--muted); font-size:13px; cursor:pointer; text-decoration:underline" id="toggle-btn" onclick="toggleMode()">Создать аккаунт</span>
+    </div>
 
     <div id="msg" class="msg"></div>
   </div>
@@ -118,11 +121,14 @@ function toggleMode(){
 
   if(isRegisterMode){
     title.textContent = "Регистрация";
+    sub.textContent = "Введи логин — пароль будет сгенерирован автоматически.";
+    loginBtn.textContent = "Зарегистрировать";
     toggleBtn.textContent = "Уже есть аккаунт";
   } else {
     title.textContent = "Вход в панель";
     sub.textContent = "Авторизация включена. Введи логин и пароль.";
     loginBtn.textContent = "Войти";
+    toggleBtn.textContent = "Создать аккаунт";
   }
 }
 
