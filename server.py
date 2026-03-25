@@ -137,7 +137,7 @@ def get_app_secret():
         for line in lines:
             if line.startswith("APP_SECRET_KEY="):
                 return line.split("=", 1)[1]
-
+    
     key = secrets.token_hex(32)
     with open(ENV_FILE, "a") as f:
         f.write(f"APP_SECRET_KEY={key}\n")
@@ -284,6 +284,20 @@ def clean_remote(value: str | None) -> str:
     value = str(value).strip()
     if value.startswith("$"):
         return ""
+    
+    # Регулярное выражение: ищем sip: (без учета регистра), захватываем все до @ или :
+    match = re.search(r'(?i)sip:([^@:]+)', value)
+    if match:
+        return match.group(1)
+    
+    # Если есть @, берем все до него
+    if '@' in value:
+        return value.split('@')[0]
+    
+    # Если нет sip: и нет @, но есть :, может это номер:порт?
+    if ':' in value and not value.startswith(':'):
+         return value.split(':')[0]
+
     return value
 
 
@@ -304,10 +318,19 @@ def set_state(number: str, state: str, peer: str | None = None) -> None:
                     if phone["call_start"] is None:
                         phone["call_start"] = time.time()
 
+                # Миграция номера собеседника: если в новом событии peer не указан,
+                # но он был определен ранее в рамках этого же вызова, сохраняем старый.
                 if peer is not None and peer != "":
                     phone["peer"] = peer
+                elif state in ["Разговор", "Удержание"] and phone.get("peer") and phone["peer"] != "Не определен":
+                    # Сохраняем существующий peer для этих состояний, если новый не пришел
+                    pass
+                elif state in ["Разговор", "Исходящий_вызов", "Входящий_вызов", "Удержание", "Снята_трубка"]:
+                    # Если peer вообще не был задан ранее
+                    if not phone.get("peer"):
+                        phone["peer"] = "Не определен"
                 else:
-                    phone["peer"] = "Не определен"
+                    phone["peer"] = ""
 
                 if state in {"В_покое", "OFFLINE", "DND"}:
                     phone["call_start"] = None
@@ -459,15 +482,7 @@ def event():
         set_state(user_phone, "Входящий_вызов", remote)
 
     elif state == "Connected":
-        current_peer = remote
-        if not current_peer:
-            with lock:
-                # Ищем по всем, так как set_state тоже ищет по всем
-                for u in users_phones.values():
-                    if user_phone in u:
-                        current_peer = u[user_phone]["peer"]
-                        break
-        set_state(user_phone, "Разговор", current_peer)
+        set_state(user_phone, "Разговор", remote)
 
     elif state == "Idle":
         set_state(user_phone, "В_покое")
@@ -625,6 +640,11 @@ def user_info():
     })
 
 
+@app.route("/static/<path:filename>")
+def static_files(filename):
+    return send_file(Path("static") / filename)
+
+
 @app.route("/admin/users")
 @login_required
 def admin_users():
@@ -668,7 +688,7 @@ def ping_once(ip: str):
         if result.returncode != 0:
             return None
 
-        # Поиск времени ответа (поддержка RU/EN локалей, Linux/Windows форматов)
+        # Поиск времени ответа (RU/EN, Linux/Windows)
         match = re.search(r"(?:time|время)[=<]\s*(\d+)", result.stdout, re.IGNORECASE)
         if match:
             return int(match.group(1))
@@ -691,8 +711,8 @@ def ping_loop() -> None:
         with lock:
             for username, phones in users_phones.items():
                 for number, phone in phones.items():
-                    # Очистка зависших состояний "Снята_трубка" (таймаут 60 сек)
-                    if phone.get("state") == "Снята_трубка" and phone.get("call_start"):
+                    # Очистка зависших состояний "Снята_трубка", "Входящий_вызов", "Исходящий_вызов" (таймаут 60 сек)
+                    if phone.get("state") in ["Снята_трубка", "Входящий_вызов", "Исходящий_вызов"] and phone.get("call_start"):
                         if now - phone["call_start"] > 60:
                             phone["state"] = "В_покое"
                             phone["call_start"] = None

@@ -118,14 +118,11 @@ function toggleMode(){
 
   if(isRegisterMode){
     title.textContent = "Регистрация";
-    sub.textContent = "Введи логин — пароль будет сгенерирован автоматически.";
-    loginBtn.textContent = "Зарегистрировать";
     toggleBtn.textContent = "Уже есть аккаунт";
   } else {
     title.textContent = "Вход в панель";
     sub.textContent = "Авторизация включена. Введи логин и пароль.";
     loginBtn.textContent = "Войти";
-    toggleBtn.textContent = "Создать аккаунт";
   }
 }
 

@@ -574,6 +574,7 @@ body{
   <div class="tabs" id="admin-tabs" style="display:none">
     <button class="tab-btn active" onclick="switchTab('monitoring')">Мониторинг</button>
     <button class="tab-btn" onclick="switchTab('accounts')" id="btn-accounts">Аккаунты</button>
+    <button class="tab-btn" onclick="switchTab('tests')" id="btn-tests">Тесты</button>
   </div>
 
   <div id="tab-monitoring" class="tab-content active">
@@ -659,6 +660,44 @@ body{
       </div>
     </div>
   </div>
+
+  <div id="tab-tests" class="tab-content">
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">Тестирование событий (Event)</div>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid" style="grid-template-columns: 1fr 1fr 1fr auto">
+          <div>
+            <div style="font-size:12px; color:var(--muted); margin-bottom:5px">IP адрес сервера</div>
+            <input id="test-ip" class="input" placeholder="например, 127.0.0.1">
+          </div>
+          <div>
+            <div style="font-size:12px; color:var(--muted); margin-bottom:5px">Событие (state)</div>
+            <select id="test-state" class="input" style="background:var(--bg2); color:var(--text); border:1px solid var(--line); height:46px; width:100%">
+              <option value="Setup">Setup (Исходящий)</option>
+              <option value="Ringing">Ringing (Входящий)</option>
+              <option value="Connected">Connected (Разговор)</option>
+              <option value="Idle">Idle (В покое)</option>
+              <option value="Hold">Hold (Удержание)</option>
+              <option value="DND">DND (DND)</option>
+              <option value="OffHook">OffHook (Трубка снята)</option>
+              <option value="OnHook">OnHook (В покое)</option>
+            </select>
+          </div>
+          <div>
+            <div style="font-size:12px; color:var(--muted); margin-bottom:5px">Локальный номер (local)</div>
+            <input id="test-local" class="input" placeholder="номер телефона">
+          </div>
+          <div style="display:flex; align-items:flex-end">
+            <button class="btn" onclick="sendTestEvent()">Отправить</button>
+          </div>
+        </div>
+        <div id="test-log" style="margin-top:20px; padding:15px; border-radius:12px; background:rgba(0,0,0,0.2); font-family:monospace; font-size:13px; max-height:200px; overflow-y:auto; border:1px solid var(--line); display:none">
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <div class="modal-backdrop" id="edit-backdrop">
@@ -686,32 +725,80 @@ let dragNumber = null;
 let refreshInFlight = false;
 let refreshPending = false;
 let socket = null;
+let socketStatus = "init";
 
 function initSocket() {
-  socket = io();
+  if (typeof io === 'undefined') {
+    console.error('Socket.IO is not loaded!');
+    setConnectionStatus("error", "Статус: Ошибка (No JS)");
+    // Если скрипт не загружен, запускаем поллинг как фолбек
+    startFallbackPolling();
+    return;
+  }
+
+  try {
+    socket = io();
+    
+    socket.on('connect', () => {
+      console.log('Socket.IO connected');
+      socketStatus = "connected";
+      setConnectionStatus("online", "Статус: Онлайн");
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Socket.IO disconnected');
+      socketStatus = "disconnected";
+      setConnectionStatus("offline", "Статус: Отключено");
+    });
+
+    socket.on('connect_error', (err) => {
+      console.error('Socket.IO connection error:', err);
+      socketStatus = "error";
+      setConnectionStatus("error", "Статус: Ошибка сокета");
+      // При ошибке подключения тоже можно запустить поллинг
+      startFallbackPolling();
+    });
+
+    socket.on('phones_update', (msg) => {
+      console.log('Update received via socket', msg);
+      refreshLoop();
+    });
+  } catch (e) {
+    console.error('Error initializing Socket.IO:', e);
+    startFallbackPolling();
+  }
+}
+
+function setConnectionStatus(type, text) {
+  const statusEl = document.getElementById("connection-status");
+  if (!statusEl) return;
   
-  socket.on('connect', () => {
-    console.log('Socket.IO connected');
-    const statusEl = document.getElementById("connection-status");
-    if (statusEl) {
-      statusEl.innerHTML = '<span class="dot green"></span> Статус: Онлайн';
-      statusEl.style.color = "var(--green)";
-    }
-  });
+  statusEl.textContent = text;
+  
+  const dots = {
+    "online": '<span class="dot green"></span> ',
+    "offline": '<span class="dot red"></span> ',
+    "error": '<span class="dot orange"></span> ',
+    "init": '<span class="dot gray"></span> '
+  };
+  
+  statusEl.innerHTML = (dots[type] || '') + text;
+  
+  const colors = {
+    "online": "var(--green)",
+    "offline": "var(--red)",
+    "error": "var(--orange)",
+    "init": "var(--gray)"
+  };
+  statusEl.style.color = colors[type] || "var(--text)";
+}
 
-  socket.on('disconnect', () => {
-    console.log('Socket.IO disconnected');
-    const statusEl = document.getElementById("connection-status");
-    if (statusEl) {
-      statusEl.innerHTML = '<span class="dot red"></span> Статус: Отключено';
-      statusEl.style.color = "var(--red)";
-    }
-  });
-
-  socket.on('phones_update', (msg) => {
-    console.log('Update received via socket', msg);
-    refreshLoop();
-  });
+let fallbackPollingStarted = false;
+function startFallbackPolling() {
+  if (fallbackPollingStarted) return;
+  console.log("Starting fallback polling...");
+  fallbackPollingStarted = true;
+  setInterval(refreshLoop, 5000); // Раз в 5 секунд, если сокеты не работают
 }
 
 function prettyState(state){
@@ -1058,6 +1145,48 @@ function switchTab(tabId){
   if(tabId === 'accounts'){
     loadAdminUsers();
   }
+  if(tabId === 'tests'){
+    const testIp = document.getElementById("test-ip");
+    if(testIp && !testIp.value){
+      testIp.value = location.hostname;
+    }
+  }
+}
+
+function sendTestEvent(){
+  const ip = document.getElementById("test-ip").value.trim();
+  const state = document.getElementById("test-state").value;
+  const local = document.getElementById("test-local").value.trim();
+  const log = document.getElementById("test-log");
+  
+  if(!ip || !local){
+    alert("Заполните IP и номер");
+    return;
+  }
+  
+  // Формируем URL. Согласно ТЗ: http://указанный_ip:8000/event?state=указанный_ивент&local=указанный номер
+  // Также добавляем токен текущего пользователя, так как сервер его требует.
+  const url = `http://${ip}:8000/event?state=${state}&local=${local}&token=${userToken}`;
+  
+  log.style.display = "block";
+  const entry = document.createElement("div");
+  entry.style.marginBottom = "5px";
+  entry.innerHTML = `<span style="color:var(--muted)">[${new Date().toLocaleTimeString()}]</span> Отправка: ${url}`;
+  log.prepend(entry);
+  
+  fetch(url, { mode: 'no-cors' })
+    .then(() => {
+      const success = document.createElement("div");
+      success.style.color = "var(--green)";
+      success.textContent = `Запрос отправлен успешно (no-cors)`;
+      log.prepend(success);
+    })
+    .catch(err => {
+      const error = document.createElement("div");
+      error.style.color = "var(--red)";
+      error.textContent = `Ошибка: ${err.message}`;
+      log.prepend(error);
+    });
 }
 
 async function loadAdminUsers(){
@@ -1152,22 +1281,18 @@ async function refreshLoop(){
   refreshInFlight = true;
   refreshPending = false;
 
-  const statusEl = document.getElementById("connection-status");
-
   try{
     const data = await fetchPhonesRaw();
     window.__lastPhones = data;
     applyStats(data);
 
-    if (statusEl) {
-      statusEl.innerHTML = '<span class="dot green"></span> Статус: Онлайн';
-      statusEl.style.color = "var(--green)";
+    if (socketStatus !== "connected") {
+        setConnectionStatus("online", "Статус: Онлайн (polling)");
     }
   }catch(e){
     console.error(e);
-    if (statusEl) {
-      statusEl.innerHTML = '<span class="dot red"></span> Статус: Ошибка';
-      statusEl.style.color = "var(--red)";
+    if (socketStatus !== "connected") {
+        setConnectionStatus("error", "Статус: Ошибка сети");
     }
   }finally{
     refreshInFlight = false;
