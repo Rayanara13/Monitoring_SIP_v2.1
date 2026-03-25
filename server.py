@@ -21,6 +21,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")
 ENV_FILE = Path(".env")
+BLOCKS_FILE = Path("users_data/login_blocks.json")
 
 if not PHONES_DIR.exists():
     PHONES_DIR.mkdir()
@@ -28,9 +29,48 @@ if not PHONES_DIR.exists():
 users_phones = {} # {username: {number: phone_data}}
 lock = threading.Lock()
 
-login_attempts = {}
 LOGIN_MAX_ATTEMPTS = 7
 LOGIN_BLOCK_SECONDS = 900  # 15 минут
+
+
+def load_login_attempts() -> dict:
+    if BLOCKS_FILE.exists():
+        try:
+            data = json.loads(BLOCKS_FILE.read_text(encoding="utf-8"))
+            now = time.time()
+            # Удаляем просроченные блокировки при загрузке
+            return {ip: rec for ip, rec in data.items() if rec.get("blocked_until", 0) > now}
+        except Exception:
+            pass
+    return {}
+
+
+def save_login_attempts() -> None:
+    try:
+        BLOCKS_FILE.write_text(
+            json.dumps(login_attempts, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+login_attempts = load_login_attempts()
+
+# Rate-limit для /event: не более 120 событий в минуту с одного IP
+event_rate: dict = {}  # {ip: {"count": int, "window_start": float}}
+EVENT_RATE_LIMIT = 120
+EVENT_RATE_WINDOW = 60
+
+
+def is_event_rate_limited(ip: str) -> bool:
+    now = time.time()
+    rec = event_rate.setdefault(ip, {"count": 0, "window_start": now})
+    if now - rec["window_start"] >= EVENT_RATE_WINDOW:
+        rec["count"] = 0
+        rec["window_start"] = now
+    rec["count"] += 1
+    return rec["count"] > EVENT_RATE_LIMIT
 
 API_AUTH_ROUTES = {"/phones", "/add_phone", "/update_phone", "/delete_phone", "/reorder"}
 
@@ -203,11 +243,13 @@ def register_login_fail(ip: str) -> None:
     if record["fails"] >= LOGIN_MAX_ATTEMPTS:
         record["blocked_until"] = now + LOGIN_BLOCK_SECONDS
         record["fails"] = 0
+        save_login_attempts()
 
 
 def register_login_success(ip: str) -> None:
     if ip in login_attempts:
         del login_attempts[ip]
+        save_login_attempts()
 
 
 def load_phones() -> None:
@@ -445,6 +487,9 @@ def logout():
 
 @app.route("/event")
 def event():
+    if is_event_rate_limited(get_client_ip()):
+        return "Too Many Requests", 429
+
     token = request.args.get("token")
     # Проверяем токен у любого пользователя
     target_user = None
@@ -482,6 +527,13 @@ def event():
         set_state(user_phone, "Входящий_вызов", remote)
 
     elif state == "Connected":
+        # Если remote пустой — сохраняем peer из предыдущего состояния (Ringing/Setup)
+        if not remote:
+            with lock:
+                for u in users_phones.values():
+                    if user_phone in u:
+                        remote = u[user_phone].get("peer") or ""
+                        break
         set_state(user_phone, "Разговор", remote)
 
     elif state == "Idle":

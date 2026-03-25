@@ -743,6 +743,8 @@ function initSocket() {
       console.log('Socket.IO connected');
       socketStatus = "connected";
       setConnectionStatus("online", "Статус: Онлайн");
+      stopFallbackPolling();
+      refreshLoop();
     });
 
     socket.on('disconnect', () => {
@@ -793,12 +795,16 @@ function setConnectionStatus(type, text) {
   statusEl.style.color = colors[type] || "var(--text)";
 }
 
-let fallbackPollingStarted = false;
+let fallbackPollingTimer = null;
 function startFallbackPolling() {
-  if (fallbackPollingStarted) return;
+  if (fallbackPollingTimer) return;
   console.log("Starting fallback polling...");
-  fallbackPollingStarted = true;
-  setInterval(refreshLoop, 5000); // Раз в 5 секунд, если сокеты не работают
+  fallbackPollingTimer = setInterval(refreshLoop, 5000);
+}
+function stopFallbackPolling() {
+  if (!fallbackPollingTimer) return;
+  clearInterval(fallbackPollingTimer);
+  fallbackPollingTimer = null;
 }
 
 function prettyState(state){
