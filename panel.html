@@ -571,10 +571,11 @@ body{
     </div>
   </div>
 
-  <div class="tabs" id="admin-tabs" style="display:none">
+  <div class="tabs" id="main-tabs">
     <button class="tab-btn active" onclick="switchTab('monitoring')">Мониторинг</button>
-    <button class="tab-btn" onclick="switchTab('accounts')" id="btn-accounts">Аккаунты</button>
-    <button class="tab-btn" onclick="switchTab('tests')" id="btn-tests">Тесты</button>
+    <button class="tab-btn" onclick="switchTab('library')">Библиотека</button>
+    <button class="tab-btn" onclick="switchTab('accounts')" id="btn-accounts" style="display:none">Аккаунты</button>
+    <button class="tab-btn" onclick="switchTab('tests')" id="btn-tests" style="display:none">Тесты</button>
   </div>
 
   <div id="tab-monitoring" class="tab-content active">
@@ -618,6 +619,30 @@ body{
         </div>
         <div id="offline-grid" class="grid"></div>
       </section>
+    </div>
+  </div>
+
+  <div id="tab-library" class="tab-content">
+    <div class="panel" style="margin-bottom:20px">
+      <div class="panel-head" style="justify-content:space-between">
+        <div class="panel-title">Мой набор карточек</div>
+        <button class="btn" id="shared-toggle-btn" onclick="toggleShared()" style="width:auto; padding:10px 20px">Загрузка...</button>
+      </div>
+      <div class="panel-body">
+        <div style="color:var(--muted); font-size:14px" id="shared-hint">
+          Сделай набор общим — другие пользователи смогут импортировать твои карточки к себе одним кликом.
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">Общие наборы</div>
+        <button class="btn ghost" style="width:auto; padding:8px 16px; font-size:13px" onclick="loadLibrary()">Обновить</button>
+      </div>
+      <div class="panel-body" id="library-body">
+        <div style="color:var(--muted); font-size:14px">Загрузка...</div>
+      </div>
     </div>
   </div>
 
@@ -1151,6 +1176,9 @@ function switchTab(tabId){
   if(tabId === 'accounts'){
     loadAdminUsers();
   }
+  if(tabId === 'library'){
+    loadLibrary();
+  }
   if(tabId === 'tests'){
     const testIp = document.getElementById("test-ip");
     if(testIp && !testIp.value){
@@ -1257,9 +1285,11 @@ async function loadUserInfo(){
     document.getElementById("welcome-msg").textContent = `Добро пожаловать, ${data.username}. Здесь вы можете управлять своими карточками.`;
     userToken = data.event_token;
     isAdmin = data.is_admin;
+    window.__currentUsername = data.username;
     
     if(isAdmin){
-      document.getElementById("admin-tabs").style.display = "flex";
+      document.getElementById("btn-accounts").style.display = "";
+      document.getElementById("btn-tests").style.display = "";
     }
   } catch (e) {
     console.error(e);
@@ -1305,6 +1335,117 @@ async function refreshLoop(){
     if (refreshPending){
       refreshLoop();
     }
+  }
+}
+
+// ── Библиотека карточек ───────────────────────────────────────────────────────
+
+let currentShared = false;
+
+async function loadLibrary(){
+  const body = document.getElementById("library-body");
+  const btn = document.getElementById("shared-toggle-btn");
+
+  try {
+    const r = await fetch("/my_shared_status");
+    const d = await r.json();
+    if(d.ok){
+      currentShared = d.shared;
+      updateSharedBtn();
+    }
+  } catch(e) {}
+
+  // Список чужих общих наборов
+  try {
+    const r = await fetch("/shared_sets");
+    if(r.status === 401){ location.href = "/login"; return; }
+    const d = await r.json();
+
+    const others = d.sets.filter(s => s.username !== (window.__currentUsername || ""));
+
+    if(!others.length){
+      body.innerHTML = `<div style="color:var(--muted); font-size:14px">Пока нет общих наборов от других пользователей.</div>`;
+      return;
+    }
+
+    body.innerHTML = others.map(s => `
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:16px;
+                  padding:14px 0; border-bottom:1px solid var(--line)">
+        <div>
+          <div style="font-weight:700; font-size:15px">${escapeHtml(s.username)}</div>
+          <div style="color:var(--muted); font-size:13px; margin-top:3px">
+            ${s.count} карточек:
+            ${s.phones.slice(0,5).map(p => `<span style="background:rgba(255,255,255,.06);
+              border-radius:6px; padding:2px 7px; margin-right:4px; font-size:12px">
+              ${escapeHtml(p.name || p.number)}</span>`).join("")}
+            ${s.count > 5 ? `<span style="color:var(--muted); font-size:12px">+${s.count - 5} ещё</span>` : ""}
+          </div>
+        </div>
+        <button class="btn btn-sm secondary" style="white-space:nowrap"
+                onclick="importSet('${escapeHtml(s.username)}')">Импортировать</button>
+      </div>
+    `).join("");
+  } catch(e) {
+    body.innerHTML = `<div style="color:var(--red); font-size:14px">Ошибка загрузки.</div>`;
+  }
+}
+
+function updateSharedBtn(){
+  const btn = document.getElementById("shared-toggle-btn");
+  const hint = document.getElementById("shared-hint");
+  if(currentShared){
+    btn.textContent = "Набор общий — сделать приватным";
+    btn.classList.add("danger");
+    btn.classList.remove("secondary");
+    hint.textContent = "Твои карточки видны другим пользователям и доступны для импорта.";
+  } else {
+    btn.textContent = "Сделать набор общим";
+    btn.classList.add("secondary");
+    btn.classList.remove("danger");
+    hint.textContent = "Сделай набор общим — другие пользователи смогут импортировать твои карточки к себе одним кликом.";
+  }
+}
+
+async function toggleShared(){
+  try {
+    const r = await fetch("/toggle_shared", {method:"POST"});
+    if(r.status === 401){ location.href = "/login"; return; }
+    const d = await r.json();
+    if(d.ok){
+      currentShared = d.shared;
+      updateSharedBtn();
+    }
+  } catch(e) {
+    console.error(e);
+  }
+}
+
+async function importSet(sourceUsername){
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = "Импорт...";
+  try {
+    const r = await fetch("/import_set", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({username: sourceUsername})
+    });
+    if(r.status === 401){ location.href = "/login"; return; }
+    const d = await r.json();
+    if(d.ok){
+      btn.textContent = `Импортировано: ${d.imported}`;
+      btn.classList.add("btn");
+      if(d.skipped){
+        btn.textContent += ` (пропущено ${d.skipped})`;
+      }
+      await refreshLoop();
+    } else {
+      btn.textContent = d.error || "Ошибка";
+    }
+  } catch(e) {
+    btn.textContent = "Ошибка";
+  } finally {
+    btn.disabled = false;
   }
 }
 

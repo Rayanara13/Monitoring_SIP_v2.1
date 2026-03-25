@@ -714,6 +714,115 @@ def admin_users():
     return jsonify({"ok": True, "users": users})
 
 
+# ── Общая библиотека карточек ─────────────────────────────────────────────────
+
+def get_user_meta(username: str) -> dict:
+    meta_file = PHONES_DIR / f"meta_{username}.json"
+    if meta_file.exists():
+        try:
+            return json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"shared": False}
+
+
+def save_user_meta(username: str, meta: dict) -> None:
+    meta_file = PHONES_DIR / f"meta_{username}.json"
+    meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+@app.route("/my_shared_status")
+@login_required
+def my_shared_status():
+    username = session.get("username")
+    meta = get_user_meta(username)
+    return jsonify({"ok": True, "shared": meta.get("shared", False)})
+
+
+@app.route("/shared_sets")
+@login_required
+def shared_sets():
+    result = []
+    for uname in AUTH.keys():
+        meta = get_user_meta(uname)
+        if not meta.get("shared"):
+            continue
+        with lock:
+            phones = users_phones.get(uname, {})
+            cards = [
+                {"number": num, "name": p["name"], "ip": p["ip"]}
+                for num, p in phones.items()
+            ]
+        result.append({
+            "username": uname,
+            "count": len(cards),
+            "phones": cards,
+        })
+    return jsonify({"ok": True, "sets": result})
+
+
+@app.route("/toggle_shared", methods=["POST"])
+@login_required
+def toggle_shared():
+    username = session.get("username")
+    meta = get_user_meta(username)
+    meta["shared"] = not meta.get("shared", False)
+    save_user_meta(username, meta)
+    return jsonify({"ok": True, "shared": meta["shared"]})
+
+
+@app.route("/import_set", methods=["POST"])
+@login_required
+def import_set():
+    current_user = session.get("username")
+    data = request.get_json(silent=True) or {}
+    source = str(data.get("username", "")).strip()
+
+    if not source or source not in AUTH:
+        return jsonify({"ok": False, "error": "Пользователь не найден"}), 404
+
+    if source == current_user:
+        return jsonify({"ok": False, "error": "Нельзя импортировать свой набор"}), 400
+
+    meta = get_user_meta(source)
+    if not meta.get("shared"):
+        return jsonify({"ok": False, "error": "Набор не является общим"}), 403
+
+    imported = 0
+    skipped = 0
+
+    with lock:
+        source_phones = users_phones.get(source, {})
+        if current_user not in users_phones:
+            users_phones[current_user] = {}
+        target = users_phones[current_user]
+        next_pos = len(target)
+
+        for number, phone in source_phones.items():
+            if number in target:
+                skipped += 1
+                continue
+            target[number] = {
+                "name": phone["name"],
+                "ip": phone["ip"],
+                "state": "В_покое",
+                "time": "-",
+                "peer": "",
+                "duration": "00:00",
+                "call_start": None,
+                "ping": "?",
+                "position": next_pos,
+            }
+            next_pos += 1
+            imported += 1
+
+    if imported:
+        save_phones(current_user)
+        broadcast_update()
+
+    return jsonify({"ok": True, "imported": imported, "skipped": skipped})
+
+
 def ping_once(ip: str):
     if not ip:
         return None
