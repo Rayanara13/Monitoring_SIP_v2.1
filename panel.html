@@ -684,6 +684,7 @@ body{
 <script>
 let dragNumber = null;
 let refreshInFlight = false;
+let refreshPending = false;
 let socket = null;
 
 function initSocket() {
@@ -1144,11 +1145,14 @@ function copyToken(){
 
 async function refreshLoop(){
   if (refreshInFlight){
+    refreshPending = true;
     return;
   }
 
-  const statusEl = document.getElementById("connection-status");
   refreshInFlight = true;
+  refreshPending = false;
+
+  const statusEl = document.getElementById("connection-status");
 
   try{
     const data = await fetchPhonesRaw();
@@ -1167,6 +1171,9 @@ async function refreshLoop(){
     }
   }finally{
     refreshInFlight = false;
+    if (refreshPending){
+      refreshLoop();
+    }
   }
 }
 
