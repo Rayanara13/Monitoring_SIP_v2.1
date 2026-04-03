@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>Server by Стёпчик</title>
+<title>Server by Стёпчик v3.3</title>
 
 <style>
 :root{
@@ -776,6 +776,7 @@ function initSocket() {
       console.log('Socket.IO disconnected');
       socketStatus = "disconnected";
       setConnectionStatus("offline", "Статус: Отключено");
+      startFallbackPolling();
     });
 
     socket.on('connect_error', (err) => {
@@ -853,7 +854,7 @@ try {
 } catch(e) {}
 
 function isOffline(state){
-  return state === "OFFLINE";
+  return state === "OFFLINE" || state === "DND";
 }
 
 function isIdle(state){
@@ -1296,17 +1297,6 @@ async function loadUserInfo(){
   }
 }
 
-function copyToken(){
-  if (!userToken) return;
-  const el = document.getElementById("event-token-display");
-  if (el.textContent === userToken) {
-    navigator.clipboard.writeText(userToken);
-    el.textContent = "Скопировано!";
-    setTimeout(() => { el.textContent = userToken; }, 1000);
-  } else {
-    el.textContent = userToken;
-  }
-}
 
 async function refreshLoop(){
   if (refreshInFlight){
@@ -1315,9 +1305,9 @@ async function refreshLoop(){
   }
 
   refreshInFlight = true;
-  refreshPending = false;
 
   try{
+    refreshPending = false;  // сбрасываем непосредственно перед fetch, уже под флагом inFlight
     const data = await fetchPhonesRaw();
     window.__lastPhones = data;
     applyStats(data);
@@ -1491,8 +1481,10 @@ window.onload = async () => {
         }
       }, 1000);
 
-  // Основной цикл обновления данных (вместо сокетов) - теперь через Socket.IO
-  // setInterval(refreshLoop, 3000);
+  // Safety-net polling: даже при живом сокете периодически сверяем данные.
+  // Если socket-событие потерялось (микросбой сети без disconnect), UI восстановится
+  // автоматически в течение 5 секунд. refreshInFlight/refreshPending не дадут дублю.
+  setInterval(refreshLoop, 5000);
 };
 
 function formatDuration(total) {

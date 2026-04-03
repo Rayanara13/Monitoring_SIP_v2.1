@@ -16,7 +16,15 @@ from concurrent.futures import ThreadPoolExecutor
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# allow_upgrades=True — используем WebSocket если доступен, иначе polling
+# ping_timeout/ping_interval — агрессивное обнаружение потери соединения
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='eventlet',
+    ping_timeout=10,
+    ping_interval=5,
+)
 
 PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")
@@ -344,7 +352,12 @@ def clean_remote(value: str | None) -> str:
 
 
 def broadcast_update():
-    socketio.emit('phones_update', {'data': 'updated'}, namespace='/')
+    # Вызывается как из request-треда, так и из фонового ping_loop.
+    # start_background_task гарантирует выполнение в eventlet green-thread контексте,
+    # что надёжнее прямого emit из обычного threading.Thread.
+    def _emit():
+        socketio.emit('phones_update', {'data': 'updated'}, namespace='/')
+    socketio.start_background_task(_emit)
 
 
 def set_state(number: str, state: str, peer: str | None = None) -> None:
@@ -896,11 +909,14 @@ def ping_loop() -> None:
                 old_state = phone.get("state")
 
                 if latency is None:
+                    phone["ping_fail_count"] = phone.get("ping_fail_count", 0) + 1
                     phone["ping"] = "Недоступен"
-                    phone["state"] = "OFFLINE"
-                    phone["call_start"] = None
-                    phone["duration"] = "00:00"
+                    if phone["ping_fail_count"] >= 3:
+                        phone["state"] = "OFFLINE"
+                        phone["call_start"] = None
+                        phone["duration"] = "00:00"
                 else:
+                    phone["ping_fail_count"] = 0
                     phone["ping"] = f"{latency} ms"
                     if phone["state"] == "OFFLINE":
                         phone["state"] = "В_покое"
@@ -937,4 +953,4 @@ def ping_loop() -> None:
 if __name__ == "__main__":
     load_phones()
     threading.Thread(target=ping_loop, daemon=True).start()
-    socketio.run(app, host="0.0.0.0", port=8000, debug=True)
+    socketio.run(app, host="0.0.0.0", port=8000, debug=False)
