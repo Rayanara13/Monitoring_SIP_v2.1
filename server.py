@@ -841,7 +841,15 @@ def event():
         set_state(user_phone, "DND", event_id=evt_id)
 
     elif state == "OffHook":
-        set_state(user_phone, "Снята_трубка", event_id=evt_id)
+        # Если звонок уже идёт (громкая → трубка) — игнорируем OffHook,
+        # чтобы не сбить состояние "Разговор" / "Удержание"
+        with lock:
+            in_call = user_phone in pending_calls
+        if in_call:
+            alog("SIP_OFFHOOK_IGNORED", event_id=evt_id,
+                 number=user_phone, reason="active_call")
+        else:
+            set_state(user_phone, "Снята_трубка", event_id=evt_id)
 
     elif state == "OnHook":
         complete_call(user_phone, event_id=evt_id)
