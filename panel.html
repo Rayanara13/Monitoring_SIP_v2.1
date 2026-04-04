@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>Server by Стёпчик v3.4.0</title>
+<title>Server by Стёпчик v3.4.3</title>
 
 <style>
 :root{
@@ -1013,6 +1013,11 @@ function isActive(state){
 function phoneCard(phone){
   const stateText = prettyState(phone.state);
   const pingClass = phone.ping && phone.ping.includes("ms") ? "ping-ok" : "ping-fail";
+  // Длительность считаем из локального таймера браузера
+  if (isActive(phone.state) && window.__callStarts && window.__callStarts[phone.number]) {
+    const diff = Math.floor(Date.now() / 1000 - window.__callStarts[phone.number]);
+    if (diff >= 0 && diff <= 86400) phone.duration = formatDuration(diff);
+  }
 
   let extraStyle = "";
   if (cardSizes[phone.number]) {
@@ -1161,20 +1166,29 @@ async function fetchPhonesRaw(){
 
   const json = await response.json();
   const elapsed = Date.now() - t0;
-
-  // Новый формат с server_time
-  if (json && typeof json.server_time === "number") {
-    window.__clockOffset = json.server_time - Date.now() / 1000;
-    clog("FETCH_OK", { count: json.phones.length, elapsed_ms: elapsed,
-                       clock_offset_ms: Math.round(window.__clockOffset * 1000) });
-    return json.phones;
-  }
-  // Fallback: plain array
-  clog("FETCH_OK", { count: Array.isArray(json) ? json.length : -1, elapsed_ms: elapsed });
-  return json;
+  const phones = json && json.phones ? json.phones : json;
+  clog("FETCH_OK", { count: Array.isArray(phones) ? phones.length : -1, elapsed_ms: elapsed });
+  return phones;
 }
 
 function applyStats(data){
+  // Обновляем карту старта звонков на основе локального времени браузера
+  if (!window.__callStarts) window.__callStarts = {};
+  const now = Date.now() / 1000;
+  const activeNumbers = new Set();
+  data.forEach(p => {
+    if (isActive(p.state)) {
+      activeNumbers.add(p.number);
+      if (!window.__callStarts[p.number]) {
+        window.__callStarts[p.number] = now;
+      }
+    }
+  });
+  // Удаляем завершившиеся звонки
+  Object.keys(window.__callStarts).forEach(num => {
+    if (!activeNumbers.has(num)) delete window.__callStarts[num];
+  });
+
   const active = data.filter(x => isActive(x.state));
   const idle = data.filter(x => isIdle(x.state));
   const offline = data.filter(x => isOffline(x.state));
@@ -1727,35 +1741,24 @@ window.onload = async () => {
   initSocket();
   refreshLoop();
   
-      // Интервал для обновления таймеров длительности разговора локально
+      // Интервал для обновления таймеров длительности — только локальный clock
       setInterval(() => {
-        if (window.__lastPhones) {
-           const now = Math.floor(Date.now() / 1000);
-           window.__lastPhones.forEach(p => {
-             const activeStates = ["Разговор", "Исходящий_вызов", "Входящий_вызов", "Удержание", "Снята_трубка"];
-             if (activeStates.includes(p.state) && p.call_start) {
-                const diff = now - Math.floor(p.call_start);
-                // Защита от нереальных цифр
-                if (diff < 0 || diff > 86400) {
-                    return;
-                }
-                
-                // Обновляем отображение длительности без полной перерисовки всех карточек
-                // Для этого найдем карточку в DOM
-                const cardEl = document.querySelector(`[data-number="${p.number}"]`);
-                if (cardEl) {
-                    const infoValues = cardEl.querySelectorAll(".info-value");
-                    if (infoValues.length > 1) { // 0: Собеседник, 1: Длительность
-                        const durationStr = formatDuration(diff);
-                        if (infoValues[1].textContent !== durationStr) {
-                            infoValues[1].textContent = durationStr;
-                            p.duration = durationStr;
-                        }
-                    }
-                }
-             }
-           });
-        }
+        if (!window.__callStarts) return;
+        const now = Date.now() / 1000;
+        Object.entries(window.__callStarts).forEach(([number, startTs]) => {
+          const diff = Math.floor(now - startTs);
+          if (diff < 0 || diff > 86400) return;
+          const cardEl = document.querySelector(`[data-number="${number}"]`);
+          if (cardEl) {
+            const infoValues = cardEl.querySelectorAll(".info-value");
+            if (infoValues.length > 1) {
+              const durationStr = formatDuration(diff);
+              if (infoValues[1].textContent !== durationStr) {
+                infoValues[1].textContent = durationStr;
+              }
+            }
+          }
+        });
       }, 1000);
 
   // Safety-net polling: даже при живом сокете периодически сверяем данные.

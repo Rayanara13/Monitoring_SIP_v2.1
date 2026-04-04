@@ -909,7 +909,7 @@ def get_phones():
          ip=get_client_ip(),
          count=len(phones),
          ws_clients=ws_clients)
-    return jsonify({"phones": phones, "server_time": time.time()})
+    return jsonify({"phones": phones})
 
 
 @app.route("/add_phone", methods=["POST"])
