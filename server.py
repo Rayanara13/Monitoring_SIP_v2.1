@@ -94,6 +94,11 @@ def alog(cat: str, level: str = "INFO", **fields) -> None:
 connected_sids: set[str] = set()
 _sids_lock = threading.Lock()
 
+# Rate-limit для /client_log: не более 120 записей в минуту с одного IP
+_client_rate: dict = {}
+CLIENT_LOG_RATE_LIMIT  = 120
+CLIENT_LOG_RATE_WINDOW = 60
+
 # ────────────────────────────────────────────────────────────────────────────
 
 users_phones = {} # {username: {number: phone_data}}
@@ -560,7 +565,10 @@ def broadcast_update(event_id: int | None = None):
 
     def _emit():
         try:
-            socketio.emit('phones_update', {'data': 'updated'}, namespace='/')
+            # event_id в payload позволяет клиенту залогировать его на приём
+            socketio.emit('phones_update',
+                          {'data': 'updated', 'event_id': event_id},
+                          namespace='/')
             alog("BROADCAST_EMIT", event_id=event_id, ws_clients=ws_clients)
         except Exception as e:
             alog("BROADCAST_ERROR", "ERROR", event_id=event_id, error=str(e))
@@ -844,6 +852,49 @@ def event():
              event_id=evt_id, state=state, number=user_phone, user=target_user)
 
     return "OK"
+
+
+@app.route("/client_log", methods=["POST"])
+def client_log():
+    """
+    Принимает лог-записи от браузера и пишет их в app.log.
+    Не требует авторизации — нужно фиксировать ошибки даже при протухшей сессии.
+    Rate-limited по IP.
+    """
+    ip = get_client_ip()
+    now = time.time()
+    rec = _client_rate.setdefault(ip, {"count": 0, "window_start": now})
+    if now - rec["window_start"] >= CLIENT_LOG_RATE_WINDOW:
+        rec["count"] = 0
+        rec["window_start"] = now
+    rec["count"] += 1
+    if rec["count"] > CLIENT_LOG_RATE_LIMIT:
+        return "", 429
+
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return "", 400
+
+    # Санируем: только строки и числа, обрезаем длинные значения
+    def _sanitize(v):
+        if isinstance(v, (int, float, bool)):
+            return v
+        return str(v)[:500]
+
+    fields = {k: _sanitize(v) for k, v in data.items()
+              if isinstance(k, str) and not k.startswith("_")}
+
+    cat   = str(fields.pop("cat",   "CLIENT")).upper()[:40]
+    level = str(fields.pop("level", "INFO")).upper()
+    if level not in ("DEBUG", "INFO", "WARNING", "ERROR"):
+        level = "INFO"
+
+    alog(f"CLIENT_{cat}", level,
+         source="browser",
+         client_ip=ip,
+         user=session.get("username"),
+         **fields)
+    return "", 204
 
 
 @app.route("/phones")

@@ -840,6 +840,40 @@ body{
 </div>
 
 <script>
+// ── Клиентский логгер ────────────────────────────────────────────────────────
+// Отправляет события на сервер → попадают в users_data/app.log
+// fire-and-forget: ошибки отправки не влияют на работу приложения
+function clog(cat, level, fields) {
+  if (typeof level === "object") { fields = level; level = "INFO"; }
+  if (!fields) fields = {};
+  const body = JSON.stringify({ cat, level: level || "INFO", ...fields });
+  try {
+    // sendBeacon надёжнее при закрытии вкладки
+    if (navigator.sendBeacon) {
+      const blob = new Blob([body], { type: "application/json" });
+      navigator.sendBeacon("/client_log", blob);
+    } else {
+      fetch("/client_log", { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+    }
+  } catch (_) {}
+}
+
+// Глобальные обработчики ошибок
+window.onerror = function(msg, src, line, col, err) {
+  clog("JS_ERROR", "ERROR", { message: String(msg), source: src, line, col, stack: err?.stack?.slice(0, 500) });
+};
+window.onunhandledrejection = function(e) {
+  clog("JS_PROMISE_REJECT", "ERROR", { reason: String(e.reason)?.slice(0, 500) });
+};
+
+// Видимость вкладки и сеть
+document.addEventListener("visibilitychange", () => {
+  clog("VISIBILITY_CHANGE", { hidden: document.hidden });
+});
+window.addEventListener("online",  () => clog("NETWORK_ONLINE"));
+window.addEventListener("offline", () => clog("NETWORK_OFFLINE", "WARNING"));
+// ─────────────────────────────────────────────────────────────────────────────
+
 let dragNumber = null;
 let refreshInFlight = false;
 let refreshPending = false;
@@ -850,26 +884,32 @@ function initSocket() {
   if (typeof io === 'undefined') {
     console.error('Socket.IO is not loaded!');
     setConnectionStatus("error", "Статус: Ошибка (No JS)");
-    // Если скрипт не загружен, запускаем поллинг как фолбек
+    clog("WS_INIT_FAILED", "ERROR", { msg: "socket.io.min.js не загружен" });
     startFallbackPolling();
     return;
   }
 
+  clog("WS_INIT");
+
   try {
     socket = io();
-    
+
     socket.on('connect', () => {
       console.log('Socket.IO connected');
       socketStatus = "connected";
       setConnectionStatus("online", "Статус: Онлайн");
       stopFallbackPolling();
+      // Логируем транспорт: websocket или polling
+      const transport = socket.io?.engine?.transport?.name || "unknown";
+      clog("WS_CONNECT", { sid: socket.id?.slice(0, 10), transport });
       refreshLoop();
     });
 
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
       console.log('Socket.IO disconnected');
       socketStatus = "disconnected";
       setConnectionStatus("offline", "Статус: Отключено");
+      clog("WS_DISCONNECT", "WARNING", { reason });
       startFallbackPolling();
     });
 
@@ -877,16 +917,25 @@ function initSocket() {
       console.error('Socket.IO connection error:', err);
       socketStatus = "error";
       setConnectionStatus("error", "Статус: Ошибка сокета");
-      // При ошибке подключения тоже можно запустить поллинг
+      clog("WS_CONNECT_ERROR", "ERROR", { error: String(err?.message || err) });
       startFallbackPolling();
     });
 
     socket.on('phones_update', (msg) => {
       console.log('Update received via socket', msg);
+      // event_id из payload позволяет связать с сервером: BROADCAST_EMIT ↔ WS_RECV
+      clog("WS_RECV", { event_id: msg?.event_id });
       refreshLoop();
     });
+
+    // Смена транспорта (upgrade: polling → websocket)
+    socket.io?.on("upgrade", (transport) => {
+      clog("WS_TRANSPORT_UPGRADE", { transport: transport?.name });
+    });
+
   } catch (e) {
     console.error('Error initializing Socket.IO:', e);
+    clog("WS_INIT_EXCEPTION", "ERROR", { error: String(e?.message || e) });
     startFallbackPolling();
   }
 }
@@ -919,12 +968,14 @@ let fallbackPollingTimer = null;
 function startFallbackPolling() {
   if (fallbackPollingTimer) return;
   console.log("Starting fallback polling...");
+  clog("FALLBACK_POLLING_START", "WARNING");
   fallbackPollingTimer = setInterval(refreshLoop, 5000);
 }
 function stopFallbackPolling() {
   if (!fallbackPollingTimer) return;
   clearInterval(fallbackPollingTimer);
   fallbackPollingTimer = null;
+  clog("FALLBACK_POLLING_STOP");
 }
 
 function prettyState(state){
@@ -1099,14 +1150,28 @@ async function reorderWithinGroup(container, sourceNumber, targetNumber){
 }
 
 async function fetchPhonesRaw(){
-  const response = await fetch("/phones?" + Date.now());
+  const t0 = Date.now();
+  const response = await fetch("/phones?" + t0);
 
   if (response.status === 401){
+    clog("FETCH_UNAUTHORIZED", "WARNING");
     location.href = "/login";
     return [];
   }
 
-  return await response.json();
+  const json = await response.json();
+  const elapsed = Date.now() - t0;
+
+  // Новый формат с server_time
+  if (json && typeof json.server_time === "number") {
+    window.__clockOffset = json.server_time - Date.now() / 1000;
+    clog("FETCH_OK", { count: json.phones.length, elapsed_ms: elapsed,
+                       clock_offset_ms: Math.round(window.__clockOffset * 1000) });
+    return json.phones;
+  }
+  // Fallback: plain array
+  clog("FETCH_OK", { count: Array.isArray(json) ? json.length : -1, elapsed_ms: elapsed });
+  return json;
 }
 
 function applyStats(data){
@@ -1126,6 +1191,9 @@ function applyStats(data){
   document.getElementById("stat-idle").textContent = idle.length;
   document.getElementById("stat-offline").textContent = offline.length;
   document.getElementById("stat-total").textContent = data.length;
+
+  clog("RENDER_OK", { total: data.length, active: active.length,
+                      idle: idle.length, offline: offline.length });
 }
 
 async function addPhone(){
@@ -1404,7 +1472,7 @@ async function refreshLoop(){
   refreshInFlight = true;
 
   try{
-    refreshPending = false;  // сбрасываем непосредственно перед fetch, уже под флагом inFlight
+    refreshPending = false;
     const data = await fetchPhonesRaw();
     window.__lastPhones = data;
     applyStats(data);
@@ -1414,6 +1482,7 @@ async function refreshLoop(){
     }
   }catch(e){
     console.error(e);
+    clog("REFRESH_ERROR", "ERROR", { error: String(e?.message || e), ws_status: socketStatus });
     if (socketStatus !== "connected") {
         setConnectionStatus("error", "Статус: Ошибка сети");
     }
