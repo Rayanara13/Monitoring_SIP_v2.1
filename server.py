@@ -9,12 +9,15 @@ import secrets
 import socket
 import sqlite3
 import os
+import logging
+import traceback
 import urllib.request
 import urllib.parse
 from pathlib import Path
 from functools import wraps
 from datetime import timedelta, datetime
 from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import RotatingFileHandler
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
@@ -33,9 +36,65 @@ AUTH_FILE = Path("auth.json")
 ENV_FILE = Path(".env")
 BLOCKS_FILE = Path("users_data/login_blocks.json")
 DB_FILE = Path("users_data/call_history.db")
+LOG_FILE = Path("users_data/app.log")
 
 if not PHONES_DIR.exists():
     PHONES_DIR.mkdir()
+
+# ─── Логгер ─────────────────────────────────────────────────────────────────
+
+class _JSONLFormatter(logging.Formatter):
+    """Форматирует каждую запись как одну строку JSON."""
+    def format(self, record: logging.LogRecord) -> str:
+        data: dict = {
+            "ts":    record.created,
+            "dt":    self.formatTime(record, "%Y-%m-%d %H:%M:%S"),
+            "level": record.levelname,
+        }
+        if hasattr(record, "fields"):
+            data.update(record.fields)
+        if record.exc_info:
+            data["traceback"] = self.formatException(record.exc_info)
+        return json.dumps(data, ensure_ascii=False, default=str)
+
+
+_raw_logger = logging.getLogger("monitoring_sip")
+_raw_logger.setLevel(logging.DEBUG)
+_raw_logger.propagate = False
+_log_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+)
+_log_handler.setFormatter(_JSONLFormatter())
+_raw_logger.addHandler(_log_handler)
+
+# Счётчик для связывания SIP-событий с broadcast и poll по event_id
+_event_seq = 0
+_event_seq_lock = threading.Lock()
+
+
+def _next_event_id() -> int:
+    global _event_seq
+    with _event_seq_lock:
+        _event_seq += 1
+        return _event_seq
+
+
+def alog(cat: str, level: str = "INFO", **fields) -> None:
+    """Записывает структурированную JSONL-строку в лог."""
+    lvl = getattr(logging, level, logging.INFO)
+    record = _raw_logger.makeRecord(
+        _raw_logger.name, lvl,
+        fn="", lno=0, msg="", args=(), exc_info=None,
+    )
+    record.fields = {"cat": cat, **fields}
+    _raw_logger.handle(record)
+
+# ─── Активные WebSocket-клиенты ─────────────────────────────────────────────
+
+connected_sids: set[str] = set()
+_sids_lock = threading.Lock()
+
+# ────────────────────────────────────────────────────────────────────────────
 
 users_phones = {} # {username: {number: phone_data}}
 pending_calls = {} # {local: {ts_start, direction, remote, username}}
@@ -137,9 +196,48 @@ def duplicate_get_request(url_path, query_params):
 @app.before_request
 def before_request_func():
     if request.method == "GET" and LOCAL_IP != TARGET_IP:
-        # Не дублируем статические файлы и иконки, если нужно сэкономить ресурсы
-        # Но по ТЗ "отправлял дублирубщие get запросы", так что дублируем всё
         duplicate_get_request(request.path, request.args.to_dict())
+
+    # Логируем все входящие HTTP-запросы
+    alog("HTTP_REQ",
+         method=request.method,
+         path=request.path,
+         ip=get_client_ip(),
+         user=session.get("username"),
+         query=dict(request.args) or None)
+
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    alog("UNHANDLED_EXCEPTION", "ERROR",
+         error=str(e),
+         traceback=traceback.format_exc(),
+         path=request.path,
+         method=request.method,
+         ip=get_client_ip())
+    return jsonify({"ok": False, "error": "Внутренняя ошибка сервера"}), 500
+
+
+@socketio.on("connect")
+def on_ws_connect():
+    with _sids_lock:
+        connected_sids.add(request.sid)
+        total = len(connected_sids)
+    alog("WS_CONNECT",
+         sid=request.sid[:10],
+         total_clients=total,
+         ip=get_client_ip(),
+         user=session.get("username"))
+
+
+@socketio.on("disconnect")
+def on_ws_disconnect():
+    with _sids_lock:
+        connected_sids.discard(request.sid)
+        total = len(connected_sids)
+    alog("WS_DISCONNECT",
+         sid=request.sid[:10],
+         total_clients=total)
 
 
 def load_or_create_auth() -> dict:
@@ -256,6 +354,8 @@ def register_login_fail(ip: str) -> None:
         record["blocked_until"] = now + LOGIN_BLOCK_SECONDS
         record["fails"] = 0
         save_login_attempts()
+        alog("AUTH_IP_BLOCKED", "WARNING",
+             ip=ip, block_seconds=LOGIN_BLOCK_SECONDS)
 
 
 def register_login_success(ip: str) -> None:
@@ -297,8 +397,11 @@ def insert_call(ts_start: float, ts_end: float, duration: int,
         )
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+    except Exception as e:
+        alog("DB_ERROR", "ERROR",
+             operation="insert_call",
+             error=str(e),
+             local=local, remote=remote)
 
 
 def cleanup_old_calls() -> None:
@@ -319,7 +422,7 @@ def cleanup_loop() -> None:
         cleanup_old_calls()
 
 
-def complete_call(user_phone: str) -> None:
+def complete_call(user_phone: str, event_id: int | None = None) -> None:
     """Завершает pending-звонок и записывает его в БД если длительность >= 3 сек."""
     with lock:
         call = pending_calls.pop(user_phone, None)
@@ -334,6 +437,24 @@ def complete_call(user_phone: str) -> None:
                 call["direction"],
                 call["username"],
             )
+            alog("CALL_LOGGED",
+                 event_id=event_id,
+                 number=user_phone,
+                 duration=duration,
+                 remote=call.get("remote"),
+                 direction=call["direction"],
+                 user=call["username"])
+        else:
+            alog("CALL_SKIPPED",
+                 event_id=event_id,
+                 number=user_phone,
+                 duration=duration,
+                 msg=f"Длительность {duration}с < 3с, в историю не записан")
+    else:
+        alog("CALL_MISS", "WARNING",
+             event_id=event_id,
+             number=user_phone,
+             msg="complete_call: нет pending_call для номера")
 
 
 def load_phones() -> None:
@@ -373,6 +494,8 @@ def load_phones() -> None:
                 "position": int(item.get("position", 0)),
             }
         users_phones[username] = loaded
+        alog("PHONES_LOADED", user=username, count=len(loaded),
+             numbers=list(loaded.keys()))
 
 
 def save_phones(username: str) -> None:
@@ -427,21 +550,35 @@ def clean_remote(value: str | None) -> str:
     return value
 
 
-def broadcast_update():
+def broadcast_update(event_id: int | None = None):
     # Вызывается как из request-треда, так и из фонового ping_loop.
     # start_background_task гарантирует выполнение в eventlet green-thread контексте,
     # что надёжнее прямого emit из обычного threading.Thread.
+    with _sids_lock:
+        ws_clients = len(connected_sids)
+    alog("BROADCAST_QUEUED", event_id=event_id, ws_clients=ws_clients)
+
     def _emit():
-        socketio.emit('phones_update', {'data': 'updated'}, namespace='/')
+        try:
+            socketio.emit('phones_update', {'data': 'updated'}, namespace='/')
+            alog("BROADCAST_EMIT", event_id=event_id, ws_clients=ws_clients)
+        except Exception as e:
+            alog("BROADCAST_ERROR", "ERROR", event_id=event_id, error=str(e))
+
     socketio.start_background_task(_emit)
 
 
-def set_state(number: str, state: str, peer: str | None = None) -> None:
+def set_state(number: str, state: str, peer: str | None = None,
+              event_id: int | None = None) -> None:
+    found = False
     with lock:
         # Ищем номер у всех пользователей
         for username, phones in users_phones.items():
             if number in phones:
+                found = True
                 phone = phones[number]
+                old_state = phone["state"]
+                old_peer  = phone.get("peer", "")
                 phone["state"] = state
 
                 if state in ["Разговор", "Исходящий_вызов", "Входящий_вызов", "Удержание", "Снята_трубка"]:
@@ -469,7 +606,23 @@ def set_state(number: str, state: str, peer: str | None = None) -> None:
                     if state == "В_покое":
                         phone["peer"] = ""
 
-    broadcast_update()
+                alog("STATE_CHANGE",
+                     event_id=event_id,
+                     number=number,
+                     from_state=old_state,
+                     to_state=state,
+                     peer_before=old_peer,
+                     peer_after=phone.get("peer", ""),
+                     user=username)
+
+    if not found:
+        alog("STATE_MISS", "WARNING",
+             event_id=event_id,
+             number=number,
+             state=state,
+             msg="Номер не найден ни у одного пользователя — карточка не обновится")
+
+    broadcast_update(event_id=event_id)
 
 
 def get_sorted_phones(username: str) -> list[dict]:
@@ -514,9 +667,13 @@ def login_page():
         session["logged_in"] = True
         session["username"] = username
         register_login_success(ip)
+        alog("AUTH_LOGIN_OK", user=username, ip=ip)
         return jsonify({"ok": True})
 
     register_login_fail(ip)
+    fails = login_attempts.get(ip, {}).get("fails", 1)
+    alog("AUTH_LOGIN_FAIL", "WARNING",
+         username=username, ip=ip, fails_so_far=fails)
     return jsonify({"ok": False, "error": "Неверный логин или пароль"}), 401
 
 
@@ -576,7 +733,10 @@ def logout():
 
 @app.route("/event")
 def event():
-    if is_event_rate_limited(get_client_ip()):
+    client_ip = get_client_ip()
+
+    if is_event_rate_limited(client_ip):
+        alog("SIP_RATE_LIMITED", "WARNING", ip=client_ip)
         return "Too Many Requests", 429
 
     token = request.args.get("token")
@@ -588,26 +748,43 @@ def event():
             break
 
     if not target_user:
+        alog("SIP_BAD_TOKEN", "WARNING",
+             ip=client_ip,
+             token_prefix=token[:6] if token else None)
         return "Unauthorized", 401
 
-    state = request.args.get("state")
-    local = normalize_number(request.args.get("local"))
+    state  = request.args.get("state")
+    local  = normalize_number(request.args.get("local"))
     remote = clean_remote(request.args.get("remote"))
 
     user_phone = local
+    evt_id = _next_event_id()
+
+    alog("SIP_RECV",
+         event_id=evt_id,
+         state=state,
+         local=local,
+         remote=remote,
+         user=target_user,
+         ip=client_ip,
+         raw_remote=request.args.get("remote"))
 
     if not user_phone:
+        alog("SIP_NO_LOCAL", "WARNING", event_id=evt_id, state=state, user=target_user)
         return "OK"
 
-    # Проверяем, есть ли этот номер у пользователя, чьим токеном воспользовались
+    # Проверяем наличие номера в карточках
     with lock:
-        if target_user not in users_phones or user_phone not in users_phones[target_user]:
-            # Можно также поискать по всем пользователям, если номер уникален, 
-            # но безопаснее ограничивать тем, чей токен.
-            # Однако в SIP один номер может быть только у одного человека в системе.
-            # Если мы хотим, чтобы /event работал глобально для всех номеров, 
-            # мы можем использовать специальный админский токен или проверять всех.
-            pass
+        phone_registered = (
+            target_user in users_phones and
+            user_phone in users_phones[target_user]
+        )
+    if not phone_registered:
+        alog("SIP_PHONE_NOT_IN_CARDS", "WARNING",
+             event_id=evt_id,
+             number=user_phone,
+             user=target_user,
+             msg="Событие пришло для номера, которого нет в карточках пользователя")
 
     if state == "Setup":
         with lock:
@@ -617,7 +794,7 @@ def event():
                 "remote": remote,
                 "username": target_user,
             }
-        set_state(user_phone, "Исходящий_вызов", remote)
+        set_state(user_phone, "Исходящий_вызов", remote, event_id=evt_id)
 
     elif state == "Ringing":
         with lock:
@@ -627,7 +804,7 @@ def event():
                 "remote": remote,
                 "username": target_user,
             }
-        set_state(user_phone, "Входящий_вызов", remote)
+        set_state(user_phone, "Входящий_вызов", remote, event_id=evt_id)
 
     elif state == "Connected":
         # Если remote пустой — сохраняем peer из предыдущего состояния (Ringing/Setup)
@@ -637,31 +814,35 @@ def event():
                     if user_phone in u:
                         remote = u[user_phone].get("peer") or ""
                         break
+            if remote:
+                alog("SIP_PEER_PRESERVED", event_id=evt_id,
+                     number=user_phone, peer=remote)
         with lock:
             if user_phone in pending_calls and remote:
                 pending_calls[user_phone]["remote"] = remote
-        set_state(user_phone, "Разговор", remote)
+        set_state(user_phone, "Разговор", remote, event_id=evt_id)
 
     elif state == "Idle":
-        complete_call(user_phone)
-        set_state(user_phone, "В_покое")
+        complete_call(user_phone, event_id=evt_id)
+        set_state(user_phone, "В_покое", event_id=evt_id)
 
     elif state == "Hold":
-        set_state(user_phone, "Удержание", remote)
+        set_state(user_phone, "Удержание", remote, event_id=evt_id)
 
     elif state == "DND":
-        set_state(user_phone, "DND")
+        set_state(user_phone, "DND", event_id=evt_id)
 
     elif state == "OffHook":
-        set_state(user_phone, "Снята_трубка")
+        set_state(user_phone, "Снята_трубка", event_id=evt_id)
 
     elif state == "OnHook":
-        complete_call(user_phone)
-        set_state(user_phone, "В_покое")
+        complete_call(user_phone, event_id=evt_id)
+        set_state(user_phone, "В_покое", event_id=evt_id)
 
-    print(
-        f"{time.strftime('%H:%M:%S')} | user={target_user} | state={state} | local={local} | remote={remote}"
-    )
+    else:
+        alog("SIP_UNKNOWN_STATE", "WARNING",
+             event_id=evt_id, state=state, number=user_phone, user=target_user)
+
     return "OK"
 
 
@@ -669,7 +850,15 @@ def event():
 @login_required
 def get_phones():
     username = session.get("username")
-    return jsonify(get_sorted_phones(username))
+    phones = get_sorted_phones(username)
+    with _sids_lock:
+        ws_clients = len(connected_sids)
+    alog("PHONES_POLL",
+         user=username,
+         ip=get_client_ip(),
+         count=len(phones),
+         ws_clients=ws_clients)
+    return jsonify({"phones": phones, "server_time": time.time()})
 
 
 @app.route("/add_phone", methods=["POST"])
@@ -1043,6 +1232,11 @@ def ping_loop() -> None:
                     # Очистка зависших состояний "Снята_трубка", "Входящий_вызов", "Исходящий_вызов" (таймаут 60 сек)
                     if phone.get("state") in ["Снята_трубка", "Входящий_вызов", "Исходящий_вызов"] and phone.get("call_start"):
                         if now - phone["call_start"] > 60:
+                            alog("STATE_TIMEOUT", "WARNING",
+                                 number=number, user=username,
+                                 state=phone["state"],
+                                 stuck_seconds=int(now - phone["call_start"]),
+                                 msg="Состояние зависло >60с, сброс в В_покое")
                             phone["state"] = "В_покое"
                             phone["call_start"] = None
                             phone["peer"] = ""
@@ -1066,7 +1260,11 @@ def ping_loop() -> None:
                 if latency is None:
                     phone["ping_fail_count"] = phone.get("ping_fail_count", 0) + 1
                     phone["ping"] = "Недоступен"
-                    if phone["ping_fail_count"] >= 3:
+                    if phone["ping_fail_count"] >= 3 and old_state != "OFFLINE":
+                        alog("PING_OFFLINE",
+                             number=num, user=uname, ip=ip_addr,
+                             fail_count=phone["ping_fail_count"],
+                             prev_state=old_state)
                         phone["state"] = "OFFLINE"
                         phone["call_start"] = None
                         phone["duration"] = "00:00"
@@ -1074,9 +1272,16 @@ def ping_loop() -> None:
                     phone["ping_fail_count"] = 0
                     phone["ping"] = f"{latency} ms"
                     if phone["state"] == "OFFLINE":
+                        alog("PING_RECOVERED",
+                             number=num, user=uname, ip=ip_addr, latency_ms=latency)
                         phone["state"] = "В_покое"
-                
-                return phone.get("ping") != old_ping or phone.get("state") != old_state
+
+                changed = phone.get("ping") != old_ping or phone.get("state") != old_state
+                if changed and phone.get("ping") != old_ping:
+                    alog("PING_CHANGE",
+                         number=num, user=uname,
+                         old_ping=old_ping, new_ping=phone["ping"])
+                return changed
 
         if snapshot:
             # Распределяем запуск процессов во времени (shaping), чтобы избежать пиков CPU.
@@ -1106,8 +1311,12 @@ def ping_loop() -> None:
 
 
 if __name__ == "__main__":
+    alog("APP_START", version="3.4.2",
+         log_file=str(LOG_FILE),
+         db_file=str(DB_FILE))
     load_phones()
     init_db()
     threading.Thread(target=ping_loop,     daemon=True).start()
     threading.Thread(target=cleanup_loop,  daemon=True).start()
+    alog("APP_READY", host="0.0.0.0", port=8000)
     socketio.run(app, host="0.0.0.0", port=8000, debug=False, allow_unsafe_werkzeug=True)
