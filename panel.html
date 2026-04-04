@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>Server by Стёпчик v3.3.4</title>
+<title>Server by Стёпчик v3.4.0</title>
 
 <style>
 :root{
@@ -502,6 +502,48 @@ body{
   text-transform:uppercase;
   letter-spacing:1px;
 }
+.history-table{
+  width:100%;
+  border-collapse:collapse;
+}
+.history-table th,.history-table td{
+  text-align:left;
+  padding:12px 14px;
+  border-bottom:1px solid var(--line);
+  font-size:14px;
+}
+.history-table th{
+  color:var(--muted);
+  font-size:12px;
+  text-transform:uppercase;
+  letter-spacing:1px;
+}
+.direction-in{ color:var(--green); font-weight:700 }
+.direction-out{ color:var(--blue); font-weight:700 }
+.history-filters{
+  display:flex;
+  gap:12px;
+  flex-wrap:wrap;
+  margin-bottom:16px;
+  align-items:flex-end;
+}
+.history-filters select,.history-filters input[type=date]{
+  background:var(--bg2);
+  color:var(--text);
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:10px 14px;
+  font-size:14px;
+  height:44px;
+}
+.history-pagination{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  margin-top:16px;
+  font-size:14px;
+  color:var(--muted);
+}
 .token-cell{
   font-family:monospace;
   background:rgba(0,0,0,.2);
@@ -574,6 +616,7 @@ body{
   <div class="tabs" id="main-tabs">
     <button class="tab-btn active" onclick="switchTab('monitoring')">Мониторинг</button>
     <button class="tab-btn" onclick="switchTab('library')">Библиотека</button>
+    <button class="tab-btn" onclick="switchTab('history')">История</button>
     <button class="tab-btn" onclick="switchTab('accounts')" id="btn-accounts" style="display:none">Аккаунты</button>
     <button class="tab-btn" onclick="switchTab('tests')" id="btn-tests" style="display:none">Тесты</button>
   </div>
@@ -682,6 +725,57 @@ body{
             <!-- Сюда прилетит список -->
           </tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-history" class="tab-content">
+    <div class="panel">
+      <div class="panel-head" style="justify-content:space-between">
+        <div class="panel-title">История звонков</div>
+        <button class="btn ghost" style="width:auto;padding:8px 16px;font-size:13px" onclick="loadHistory()">Обновить</button>
+      </div>
+      <div class="panel-body">
+        <div class="history-filters">
+          <div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:5px">Номер</div>
+            <select id="hist-number" onchange="loadHistory()">
+              <option value="">Все номера</option>
+            </select>
+          </div>
+          <div>
+            <div style="font-size:12px;color:var(--muted);margin-bottom:5px">Дата</div>
+            <input type="date" id="hist-date" onchange="loadHistory()">
+          </div>
+          <div id="hist-user-wrap" style="display:none">
+            <div style="font-size:12px;color:var(--muted);margin-bottom:5px">Пользователь</div>
+            <select id="hist-user" onchange="loadHistory()">
+              <option value="">Все пользователи</option>
+            </select>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>Дата / Время</th>
+                <th>Номер</th>
+                <th>Собеседник</th>
+                <th>Направление</th>
+                <th>Длительность</th>
+                <th id="hist-col-user" style="display:none">Пользователь</th>
+              </tr>
+            </thead>
+            <tbody id="hist-body">
+              <tr><td colspan="6" style="color:var(--muted);text-align:center;padding:30px">Загрузка...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="history-pagination">
+          <button class="btn ghost" style="width:auto;padding:8px 16px;font-size:13px" onclick="histPage(-1)" id="hist-prev">← Назад</button>
+          <span id="hist-page-info">—</span>
+          <button class="btn ghost" style="width:auto;padding:8px 16px;font-size:13px" onclick="histPage(1)" id="hist-next">Вперёд →</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1180,6 +1274,9 @@ function switchTab(tabId){
   if(tabId === 'library'){
     loadLibrary();
   }
+  if(tabId === 'history'){
+    initHistoryTab();
+  }
   if(tabId === 'tests'){
     const testIp = document.getElementById("test-ip");
     if(testIp && !testIp.value){
@@ -1437,6 +1534,117 @@ async function importSet(sourceUsername){
   } finally {
     btn.disabled = false;
   }
+}
+
+// ── История звонков ───────────────────────────────────────────────────────────
+
+let histOffset = 0;
+const HIST_LIMIT = 50;
+let histTotal = 0;
+let histTabInited = false;
+
+async function initHistoryTab(){
+  if(!histTabInited){
+    histTabInited = true;
+    // Заполняем дропдаун номеров
+    const sel = document.getElementById("hist-number");
+    if(window.__lastPhones){
+      window.__lastPhones.forEach(p => {
+        const opt = document.createElement("option");
+        opt.value = p.number;
+        opt.textContent = p.name ? `${p.name} (${p.number})` : p.number;
+        sel.appendChild(opt);
+      });
+    }
+    // Для admin — показываем фильтр по пользователю и столбец
+    if(isAdmin){
+      document.getElementById("hist-user-wrap").style.display = "";
+      document.getElementById("hist-col-user").style.display = "";
+      try{
+        const r = await fetch("/admin/users");
+        const d = await r.json();
+        if(d.ok){
+          const usel = document.getElementById("hist-user");
+          d.users.forEach(u => {
+            const opt = document.createElement("option");
+            opt.value = u.username;
+            opt.textContent = u.username;
+            usel.appendChild(opt);
+          });
+        }
+      }catch(e){}
+    }
+  }
+  histOffset = 0;
+  loadHistory();
+}
+
+async function loadHistory(){
+  const number = document.getElementById("hist-number").value;
+  const date   = document.getElementById("hist-date").value;
+  const user   = isAdmin ? document.getElementById("hist-user").value : "";
+
+  const params = new URLSearchParams({limit: HIST_LIMIT, offset: histOffset});
+  if(number) params.set("number", number);
+  if(date)   params.set("date", date);
+  if(user)   params.set("username", user);
+
+  const tbody = document.getElementById("hist-body");
+  tbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:30px">Загрузка...</td></tr>`;
+
+  try{
+    const r = await fetch("/history?" + params.toString());
+    if(r.status === 401){ location.href = "/login"; return; }
+    const d = await r.json();
+    if(!d.ok){ throw new Error(d.error); }
+
+    histTotal = d.total;
+    updateHistPagination();
+
+    if(!d.records.length){
+      tbody.innerHTML = `<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:30px">Звонков нет</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = d.records.map(rec => {
+      const dt = new Date(rec.ts_start * 1000);
+      const dateStr = dt.toLocaleDateString("ru-RU");
+      const timeStr = dt.toLocaleTimeString("ru-RU");
+      const dir = rec.direction === "in"
+        ? `<span class="direction-in">← Вх.</span>`
+        : `<span class="direction-out">→ Исх.</span>`;
+      const dur = formatDuration(rec.duration);
+      const userCol = isAdmin
+        ? `<td>${escapeHtml(rec.username)}</td>`
+        : "";
+      return `<tr>
+        <td>${dateStr} ${timeStr}</td>
+        <td>${escapeHtml(rec.local)}</td>
+        <td>${escapeHtml(rec.remote)}</td>
+        <td>${dir}</td>
+        <td>${dur}</td>
+        ${userCol}
+      </tr>`;
+    }).join("");
+  }catch(e){
+    tbody.innerHTML = `<tr><td colspan="6" style="color:var(--red);text-align:center;padding:20px">Ошибка: ${escapeHtml(String(e))}</td></tr>`;
+  }
+}
+
+function updateHistPagination(){
+  const pageNum = Math.floor(histOffset / HIST_LIMIT) + 1;
+  const pageMax = Math.max(Math.ceil(histTotal / HIST_LIMIT), 1);
+  document.getElementById("hist-page-info").textContent =
+    `Стр. ${pageNum} / ${pageMax} (всего ${histTotal})`;
+  document.getElementById("hist-prev").disabled = histOffset === 0;
+  document.getElementById("hist-next").disabled = histOffset + HIST_LIMIT >= histTotal;
+}
+
+function histPage(dir){
+  const newOffset = histOffset + dir * HIST_LIMIT;
+  if(newOffset < 0 || newOffset >= histTotal) return;
+  histOffset = newOffset;
+  loadHistory();
 }
 
 document.getElementById("edit-backdrop").addEventListener("click", (e) => {

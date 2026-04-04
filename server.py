@@ -7,11 +7,13 @@ import threading
 import re
 import secrets
 import socket
+import sqlite3
+import os
 import urllib.request
 import urllib.parse
 from pathlib import Path
 from functools import wraps
-from datetime import timedelta
+from datetime import timedelta, datetime
 from concurrent.futures import ThreadPoolExecutor
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -21,7 +23,7 @@ app = Flask(__name__)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode='eventlet',
+    async_mode='threading',
     ping_timeout=10,
     ping_interval=5,
 )
@@ -30,11 +32,13 @@ PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")
 ENV_FILE = Path(".env")
 BLOCKS_FILE = Path("users_data/login_blocks.json")
+DB_FILE = Path("users_data/call_history.db")
 
 if not PHONES_DIR.exists():
     PHONES_DIR.mkdir()
 
 users_phones = {} # {username: {number: phone_data}}
+pending_calls = {} # {local: {ts_start, direction, remote, username}}
 lock = threading.Lock()
 
 LOGIN_MAX_ATTEMPTS = 7
@@ -258,6 +262,78 @@ def register_login_success(ip: str) -> None:
     if ip in login_attempts:
         del login_attempts[ip]
         save_login_attempts()
+
+
+def init_db() -> None:
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS call_log (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_start  REAL    NOT NULL,
+            ts_end    REAL    NOT NULL,
+            duration  INTEGER NOT NULL,
+            local     TEXT    NOT NULL,
+            remote    TEXT    NOT NULL,
+            direction TEXT    NOT NULL,
+            username  TEXT    NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts    ON call_log(ts_start)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_local ON call_log(local)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_user  ON call_log(username)")
+    conn.commit()
+    conn.close()
+    os.chmod(DB_FILE, 0o600)
+
+
+def insert_call(ts_start: float, ts_end: float, duration: int,
+                local: str, remote: str, direction: str, username: str) -> None:
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute(
+            "INSERT INTO call_log (ts_start,ts_end,duration,local,remote,direction,username)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (ts_start, ts_end, duration, local, remote, direction, username)
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def cleanup_old_calls() -> None:
+    try:
+        cutoff = time.time() - 86400  # 24 часа
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("DELETE FROM call_log WHERE ts_start < ?", (cutoff,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def cleanup_loop() -> None:
+    cleanup_old_calls()
+    while True:
+        time.sleep(6 * 3600)
+        cleanup_old_calls()
+
+
+def complete_call(user_phone: str) -> None:
+    """Завершает pending-звонок и записывает его в БД если длительность >= 3 сек."""
+    with lock:
+        call = pending_calls.pop(user_phone, None)
+    if call:
+        ts_end = time.time()
+        duration = int(ts_end - call["ts_start"])
+        if duration >= 3:
+            insert_call(
+                call["ts_start"], ts_end, duration,
+                user_phone,
+                call["remote"] or "Не определен",
+                call["direction"],
+                call["username"],
+            )
 
 
 def load_phones() -> None:
@@ -534,9 +610,23 @@ def event():
             pass
 
     if state == "Setup":
+        with lock:
+            pending_calls[user_phone] = {
+                "ts_start": time.time(),
+                "direction": "out",
+                "remote": remote,
+                "username": target_user,
+            }
         set_state(user_phone, "Исходящий_вызов", remote)
 
     elif state == "Ringing":
+        with lock:
+            pending_calls[user_phone] = {
+                "ts_start": time.time(),
+                "direction": "in",
+                "remote": remote,
+                "username": target_user,
+            }
         set_state(user_phone, "Входящий_вызов", remote)
 
     elif state == "Connected":
@@ -547,9 +637,13 @@ def event():
                     if user_phone in u:
                         remote = u[user_phone].get("peer") or ""
                         break
+        with lock:
+            if user_phone in pending_calls and remote:
+                pending_calls[user_phone]["remote"] = remote
         set_state(user_phone, "Разговор", remote)
 
     elif state == "Idle":
+        complete_call(user_phone)
         set_state(user_phone, "В_покое")
 
     elif state == "Hold":
@@ -562,6 +656,7 @@ def event():
         set_state(user_phone, "Снята_трубка")
 
     elif state == "OnHook":
+        complete_call(user_phone)
         set_state(user_phone, "В_покое")
 
     print(
@@ -836,6 +931,66 @@ def import_set():
     return jsonify({"ok": True, "imported": imported, "skipped": skipped})
 
 
+@app.route("/history")
+@login_required
+def get_history():
+    username = session.get("username")
+    number_filter = request.args.get("number", "").strip()
+    date_filter   = request.args.get("date", "").strip()
+    user_filter   = request.args.get("username", "").strip()  # только для admin
+    limit  = min(max(int(request.args.get("limit",  50)), 1), 200)
+    offset = max(int(request.args.get("offset", 0)), 0)
+
+    is_admin = (username == "admin")
+
+    with lock:
+        user_numbers = list(users_phones.get(username, {}).keys())
+
+    conditions: list[str] = []
+    params: list = []
+
+    if not is_admin:
+        if not user_numbers:
+            return jsonify({"ok": True, "records": [], "total": 0})
+        placeholders = ",".join("?" * len(user_numbers))
+        conditions.append(f"local IN ({placeholders})")
+        params.extend(user_numbers)
+    else:
+        if user_filter:
+            conditions.append("username = ?")
+            params.append(user_filter)
+
+    if number_filter:
+        conditions.append("local = ?")
+        params.append(number_filter)
+
+    if date_filter:
+        try:
+            day_start = datetime.strptime(date_filter, "%Y-%m-%d")
+            day_end   = day_start + timedelta(days=1)
+            conditions.append("ts_start >= ? AND ts_start < ?")
+            params.extend([day_start.timestamp(), day_end.timestamp()])
+        except ValueError:
+            pass
+
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM call_log {where}", params
+        ).fetchone()[0]
+        rows = conn.execute(
+            f"SELECT * FROM call_log {where} ORDER BY ts_start DESC LIMIT ? OFFSET ?",
+            params + [limit, offset]
+        ).fetchall()
+        conn.close()
+        return jsonify({"ok": True, "records": [dict(r) for r in rows], "total": total})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 def ping_once(ip: str):
     if not ip:
         return None
@@ -952,5 +1107,7 @@ def ping_loop() -> None:
 
 if __name__ == "__main__":
     load_phones()
-    threading.Thread(target=ping_loop, daemon=True).start()
-    socketio.run(app, host="0.0.0.0", port=8000, debug=False)
+    init_db()
+    threading.Thread(target=ping_loop,     daemon=True).start()
+    threading.Thread(target=cleanup_loop,  daemon=True).start()
+    socketio.run(app, host="0.0.0.0", port=8000, debug=False, allow_unsafe_werkzeug=True)
