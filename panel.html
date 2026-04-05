@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>Server by Стёпчик v3.4.3</title>
+<title>Server by Стёпчик v3.4.5</title>
 
 <style>
 :root{
@@ -573,9 +573,47 @@ body{
   }
 }
 </style>
+<style>
+#update-overlay{
+  display:none;
+  position:fixed;inset:0;z-index:9999;
+  background:rgba(11,16,32,.92);
+  backdrop-filter:blur(6px);
+  align-items:center;justify-content:center;
+}
+#update-overlay.visible{display:flex;}
+.update-box{
+  background:#12192b;
+  border:1px solid #2a3a6a;
+  border-radius:12px;
+  padding:40px 48px;
+  text-align:center;
+  max-width:420px;
+  box-shadow:0 8px 40px rgba(0,0,0,.6);
+}
+.update-box h2{margin:0 0 12px;font-size:1.4rem;color:#e8eefc;}
+.update-box p{margin:0 0 28px;color:#8899cc;font-size:.95rem;line-height:1.5;}
+.update-btn{
+  display:inline-block;
+  padding:12px 32px;
+  background:#2563eb;
+  color:#fff;
+  border:none;border-radius:8px;
+  font-size:1rem;font-weight:600;
+  cursor:pointer;transition:background .15s;
+}
+.update-btn:hover{background:#1d4ed8;}
+</style>
 </head>
 <script src="/static/socket.io.min.js"></script>
 <body>
+<div id="update-overlay">
+  <div class="update-box">
+    <h2>Доступно обновление</h2>
+    <p>Сервер мониторинга был обновлён.<br>Пожалуйста, обновите страницу.</p>
+    <button class="update-btn" onclick="location.reload()">Обновить страницу</button>
+  </div>
+</div>
 <div class="container">
 
   <div class="hero">
@@ -840,6 +878,8 @@ body{
 </div>
 
 <script>
+const LOADED_VERSION = "3.4.4";
+
 // ── Клиентский логгер ────────────────────────────────────────────────────────
 // Отправляет события на сервер → попадают в users_data/app.log
 // fire-and-forget: ошибки отправки не влияют на работу приложения
@@ -919,6 +959,12 @@ function initSocket() {
       setConnectionStatus("error", "Статус: Ошибка сокета");
       clog("WS_CONNECT_ERROR", "ERROR", { error: String(err?.message || err) });
       startFallbackPolling();
+    });
+
+    socket.on('server_version', (msg) => {
+      if (msg?.version && msg.version !== LOADED_VERSION) {
+        document.getElementById('update-overlay').classList.add('visible');
+      }
     });
 
     socket.on('phones_update', (msg) => {

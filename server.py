@@ -27,9 +27,11 @@ socketio = SocketIO(
     app,
     cors_allowed_origins="*",
     async_mode='threading',
-    ping_timeout=10,
-    ping_interval=5,
+    ping_timeout=25,
+    ping_interval=10,
 )
+
+VERSION = "3.4.5"
 
 PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")
@@ -62,7 +64,7 @@ _raw_logger = logging.getLogger("monitoring_sip")
 _raw_logger.setLevel(logging.DEBUG)
 _raw_logger.propagate = False
 _log_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=24, encoding="utf-8"
 )
 _log_handler.setFormatter(_JSONLFormatter())
 _raw_logger.addHandler(_log_handler)
@@ -233,6 +235,7 @@ def on_ws_connect():
          total_clients=total,
          ip=get_client_ip(),
          user=session.get("username"))
+    socketio.emit("server_version", {"version": VERSION}, to=request.sid)
 
 
 @socketio.on("disconnect")
@@ -1318,7 +1321,11 @@ def ping_loop() -> None:
 
                 if latency is None:
                     phone["ping_fail_count"] = phone.get("ping_fail_count", 0) + 1
-                    phone["ping"] = "Недоступен"
+                    phone["ping_ok_count"] = 0
+                    # Показываем "Недоступен" только после 2 подряд неудач (~20с),
+                    # чтобы убрать мигания при кратковременных потерях пакетов
+                    if phone["ping_fail_count"] >= 2:
+                        phone["ping"] = "Недоступен"
                     if phone["ping_fail_count"] >= 3 and old_state != "OFFLINE":
                         alog("PING_OFFLINE",
                              number=num, user=uname, ip=ip_addr,
@@ -1329,8 +1336,11 @@ def ping_loop() -> None:
                         phone["duration"] = "00:00"
                 else:
                     phone["ping_fail_count"] = 0
+                    phone["ping_ok_count"] = phone.get("ping_ok_count", 0) + 1
                     phone["ping"] = f"{latency} ms"
-                    if phone["state"] == "OFFLINE":
+                    # Восстанавливаем из OFFLINE только после 2 подряд успехов (~20с),
+                    # чтобы не прыгать обратно при случайном единичном пакете
+                    if phone["state"] == "OFFLINE" and phone["ping_ok_count"] >= 2:
                         alog("PING_RECOVERED",
                              number=num, user=uname, ip=ip_addr, latency_ms=latency)
                         phone["state"] = "В_покое"
@@ -1370,7 +1380,7 @@ def ping_loop() -> None:
 
 
 if __name__ == "__main__":
-    alog("APP_START", version="3.4.2",
+    alog("APP_START", version=VERSION,
          log_file=str(LOG_FILE),
          db_file=str(DB_FILE))
     load_phones()
