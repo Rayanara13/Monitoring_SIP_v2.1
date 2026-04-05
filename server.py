@@ -31,7 +31,7 @@ socketio = SocketIO(
     ping_interval=10,
 )
 
-VERSION = "3.4.6"
+VERSION = "3.4.7"
 
 PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")

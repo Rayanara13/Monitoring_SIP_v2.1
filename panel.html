@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>Server by Стёпчик v3.4.6</title>
+<title>Server by Стёпчик v3.4.7</title>
 
 <style>
 :root{
@@ -878,7 +878,7 @@ body{
 </div>
 
 <script>
-const LOADED_VERSION = "3.4.4";
+let _serverVersion = null; // запоминается при первом WS-подключении в этой сессии
 
 // ── Клиентский логгер ────────────────────────────────────────────────────────
 // Отправляет события на сервер → попадают в users_data/app.log
@@ -962,8 +962,11 @@ function initSocket() {
     });
 
     socket.on('server_version', (msg) => {
-      if (msg?.version && msg.version !== LOADED_VERSION) {
-        document.getElementById('update-overlay').classList.add('visible');
+      if (!msg?.version) return;
+      if (_serverVersion === null) {
+        _serverVersion = msg.version; // первое подключение — просто запоминаем
+      } else if (msg.version !== _serverVersion) {
+        document.getElementById('update-overlay').classList.add('visible'); // сервер перезапустился с новой версией
       }
     });
 
