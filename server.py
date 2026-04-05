@@ -31,7 +31,7 @@ socketio = SocketIO(
     ping_interval=10,
 )
 
-VERSION = "3.4.5"
+VERSION = "3.4.6"
 
 PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")
@@ -1032,7 +1032,9 @@ def reorder():
 @app.route("/")
 @login_required
 def panel():
-    return send_file("panel.html")
+    response = send_file("panel.html")
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/favicon.ico")
