@@ -31,7 +31,7 @@ socketio = SocketIO(
     ping_interval=10,
 )
 
-VERSION = "3.4.7"
+VERSION = "Release"
 
 PHONES_DIR = Path("users_data")
 AUTH_FILE = Path("auth.json")
@@ -967,16 +967,25 @@ def update_phone():
     username = session.get("username")
     data = request.get_json(force=True)
 
-    number = normalize_number(data.get("number"))
+    old_number = normalize_number(data.get("old_number") or data.get("number"))
+    new_number = normalize_number(data.get("number"))
     name = normalize_number(data.get("name"))
     ip = normalize_number(data.get("ip"))
 
+    if not new_number:
+        return jsonify({"ok": False, "error": "Номер не может быть пустым"}), 400
+
     with lock:
-        if username not in users_phones or number not in users_phones[username]:
+        if username not in users_phones or old_number not in users_phones[username]:
             return jsonify({"ok": False, "error": "Номер не найден"}), 404
 
-        users_phones[username][number]["name"] = name or number
-        users_phones[username][number]["ip"] = ip
+        if new_number != old_number and new_number in users_phones[username]:
+            return jsonify({"ok": False, "error": "Такой номер уже существует"}), 400
+
+        phone = users_phones[username].pop(old_number)
+        phone["name"] = name or new_number
+        phone["ip"] = ip
+        users_phones[username][new_number] = phone
 
     save_phones(username)
     broadcast_update()
@@ -1191,8 +1200,10 @@ def get_history():
     number_filter = request.args.get("number", "").strip()
     date_filter   = request.args.get("date", "").strip()
     user_filter   = request.args.get("username", "").strip()  # только для admin
-    limit  = min(max(int(request.args.get("limit",  50)), 1), 200)
-    offset = max(int(request.args.get("offset", 0)), 0)
+    page     = max(int(request.args.get("page", 1)), 1)
+    per_page = min(max(int(request.args.get("per_page", 50)), 1), 200)
+    limit    = per_page
+    offset   = (page - 1) * per_page
 
     is_admin = (username == "admin")
 

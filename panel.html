@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" href="data:,">
-<title>SIP Monitor</title>
+<title>SIP Monitor by Стёпчик SVL 1.0</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="/static/socket.io.min.js"></script>
@@ -87,8 +87,8 @@ body {
 .app {
   position: relative;
   z-index: 1;
-  display: grid;
-  grid-template-rows: auto 1fr;
+  display: flex;
+  flex-direction: column;
   min-height: 100vh;
 }
 
@@ -437,7 +437,7 @@ body {
 }
 .card-info { flex: 1; min-width: 0; }
 .card-name {
-  font-size: 15px;
+  font-size: 23px;
   font-weight: 700;
   line-height: 1.2;
   margin-bottom: 3px;
@@ -986,7 +986,8 @@ tbody td:first-child { color: var(--text); }
       <button class="btn btn-ghost btn-sm" onclick="closeEditModal()">✕</button>
     </div>
     <div class="modal-body">
-      <input class="modal-inp" id="edit-number" placeholder="Номер" readonly>
+      <input class="modal-inp" id="edit-number" placeholder="Номер">
+      <input type="hidden" id="edit-original-number">
       <input class="modal-inp" id="edit-name" placeholder="Название / кабинет">
       <input class="modal-inp" id="edit-ip" placeholder="IP адрес">
     </div>
@@ -1058,15 +1059,34 @@ function initSocket() {
 function setConn(state) {
   const dot = $('conn-dot'), txt = $('conn-text');
   dot.className = 'conn-dot';
-  if (state === 'online')  { dot.classList.add(); txt.textContent = 'Онлайн'; }
+  if (state === 'online')  { txt.textContent = 'Онлайн'; }
   if (state === 'offline') { dot.classList.add('offline'); txt.textContent = 'Отключено'; }
   if (state === 'error')   { dot.classList.add('error'); txt.textContent = 'Ошибка'; }
-  if (state === 'online')  txt.textContent = 'Онлайн';
 }
 
 let pollingTimer = null;
 function startPolling() { if (!pollingTimer) pollingTimer = setInterval(refreshPhones, 5000); }
 function stopPolling()  { if (pollingTimer) { clearInterval(pollingTimer); pollingTimer = null; } }
+
+// ── Duration ticker ───────────────────────────────────────────────
+const _callStarts = {};  // number → unix timestamp (seconds)
+
+function _fmtDur(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+setInterval(() => {
+  const now = Date.now() / 1000;
+  for (const [num, ts] of Object.entries(_callStarts)) {
+    const el = document.querySelector(`.card[data-number="${CSS.escape(num)}"] .duration`);
+    if (el) el.textContent = _fmtDur(Math.max(0, Math.floor(now - ts)));
+  }
+}, 1000);
 
 // ── Data refresh ─────────────────────────────────────────────────
 let refreshing = false;
@@ -1076,13 +1096,24 @@ async function refreshPhones() {
   try {
     const res = await fetch('/phones');
     if (res.status === 401) { location.href = '/login'; return; }
-    const phones = await res.json();
+    const json = await res.json();
+    const phones = Array.isArray(json) ? json : (json.phones ?? []);
     renderMonitoring(phones);
   } catch(e) {}
   finally { refreshing = false; }
 }
 
 function renderMonitoring(phones) {
+  // обновляем карту call_start для тикера
+  const activeNums = new Set();
+  phones.forEach(p => {
+    if (p.call_start != null) {
+      _callStarts[p.number] = p.call_start;
+      activeNums.add(p.number);
+    }
+  });
+  Object.keys(_callStarts).forEach(n => { if (!activeNums.has(n)) delete _callStarts[n]; });
+
   // stats
   let active = 0, idle = 0, offline = 0;
   phones.forEach(p => {
@@ -1241,6 +1272,7 @@ async function deletePhone(number) {
 
 function openEdit(number, name, ip) {
   $('edit-number').value = number;
+  $('edit-original-number').value = number;
   $('edit-name').value = name;
   $('edit-ip').value = ip;
   $('edit-backdrop').classList.add('open');
@@ -1250,12 +1282,13 @@ function closeEditModal(e) {
   $('edit-backdrop').classList.remove('open');
 }
 async function saveEdit() {
-  const number = $('edit-number').value;
+  const old_number = $('edit-original-number').value;
+  const number = $('edit-number').value.trim();
   const name   = $('edit-name').value.trim();
   const ip     = $('edit-ip').value.trim();
   const res = await fetch('/update_phone', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({number, name, ip})
+    body: JSON.stringify({old_number, number, name, ip})
   });
   const data = await res.json();
   if (data.ok) { $('edit-backdrop').classList.remove('open'); refreshPhones(); }
@@ -1356,7 +1389,7 @@ async function loadHistoryPage() {
 }
 function renderHistory(d) {
   const tbody = $('hist-body');
-  const rows = d.items || d.history || d || [];
+  const rows = d.items || d.records || d.history || [];
   const total = d.total ?? rows.length;
   const pages = Math.ceil(total / historyPageSize) || 1;
 
@@ -1366,8 +1399,8 @@ function renderHistory(d) {
     const dirClass = r.direction === 'in' ? 'dir-in' : 'dir-out';
     const dirLabel = r.direction === 'in' ? '↙ Входящий' : '↗ Исходящий';
     return `<tr>
-      <td class="mono">${esc(r.datetime || r.time || '—')}</td>
-      <td>${esc(r.number || '—')}</td>
+      <td class="mono">${esc(r.datetime || r.time || (r.ts_start ? new Date(r.ts_start * 1000).toLocaleString('ru') : '—'))}</td>
+      <td>${esc(r.number || r.local || '—')}</td>
       <td>${esc(r.peer || r.remote || '—')}</td>
       <td class="${dirClass}">${dirLabel}</td>
       <td class="mono">${esc(r.duration || '—')}</td>
@@ -1452,7 +1485,8 @@ async function initUserInfo() {
       $('hist-user-wrap').style.display = '';
     }
     // populate hist number filter
-    const phones = await (await fetch('/phones')).json();
+    const _pj = await (await fetch('/phones')).json();
+    const phones = Array.isArray(_pj) ? _pj : (_pj.phones ?? []);
     const sel = $('hist-number');
     phones.forEach(p => {
       const opt = document.createElement('option');
