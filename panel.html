@@ -1081,10 +1081,10 @@ function _fmtDur(sec) {
 }
 
 setInterval(() => {
-  const now = Date.now() / 1000;
+  const now = Date.now();
   for (const [num, ts] of Object.entries(_callStarts)) {
     const el = document.querySelector(`.card[data-number="${CSS.escape(num)}"] .duration`);
-    if (el) el.textContent = _fmtDur(Math.max(0, Math.floor(now - ts)));
+    if (el) el.textContent = _fmtDur(Math.max(0, Math.floor((now - ts) / 1000)));
   }
 }, 1000);
 
@@ -1104,11 +1104,13 @@ async function refreshPhones() {
 }
 
 function renderMonitoring(phones) {
-  // обновляем карту call_start для тикера
+  // обновляем карту для тикера: храним клиентский timestamp начала
+  // чтобы не зависеть от расхождения часов сервера и браузера
   const activeNums = new Set();
+  const clientNow = Date.now();
   phones.forEach(p => {
-    if (p.call_start != null) {
-      _callStarts[p.number] = p.call_start;
+    if (p.duration_sec != null) {
+      _callStarts[p.number] = clientNow - p.duration_sec * 1000;
       activeNums.add(p.number);
     }
   });

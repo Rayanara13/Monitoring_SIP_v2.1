@@ -644,11 +644,12 @@ def get_sorted_phones(username: str) -> list[dict]:
         phones = users_phones[username]
         result = []
 
+        now = time.time()
         for number, phone in phones.items():
-            result.append({
-                "number": number,
-                **phone
-            })
+            entry = {"number": number, **phone}
+            if phone.get("call_start") is not None:
+                entry["duration_sec"] = int(now - phone["call_start"])
+            result.append(entry)
 
     result.sort(key=lambda x: int(x["position"]))
     return result
